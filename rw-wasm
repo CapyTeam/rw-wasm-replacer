@@ -1,0 +1,2592 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_VERSION="1.0.0"
+SCRIPT_NAME="Remnawawe WASM Replacer by CapyTeam"
+SCRIPT_REPO="CapyTeam/rw-wasm-replacer"
+PANEL_BACKEND_REPO="remnawave/backend"
+PANEL_FRONTEND_REPO="remnawave/frontend"
+EDITOR_REPO="VAQYBIN/Remnawave-Xray-UI-Editor"
+
+# Correct UTF-8 width for the colored terminal menu.
+if command -v locale >/dev/null 2>&1; then
+    if locale -a 2>/dev/null | grep -qi '^C\.utf8$'; then
+        export LC_ALL=C.utf8
+    elif locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then
+        export LC_ALL=C.UTF-8
+    fi
+fi
+
+STATE_ROOT="${RW_WASM_STATE_ROOT:-/var/lib/rw-wasm-replacer}"
+CACHE_ROOT="${RW_WASM_CACHE_ROOT:-/var/cache/rw-wasm-replacer}"
+BUILD_ROOT="${RW_WASM_BUILD_ROOT:-/opt/rw-wasm-replacer/build}"
+BACKUP_ROOT="$STATE_ROOT/backups"
+LOCK_FILE="${RW_WASM_LOCK_FILE:-/var/lock/rw-wasm-replacer.lock}"
+LOG_FILE="${RW_WASM_LOG_FILE:-/var/log/rw-wasm-replacer.log}"
+
+PANEL_CONTAINER_DEFAULT="remnawave"
+EDITOR_CONTAINER_DEFAULT="remnawave-xray-ui-editor"
+PANEL_DIR_DEFAULT="/opt/remnawave"
+EDITOR_DIR_DEFAULT="/opt/remnawave-xray-ui-editor"
+LABEL_NS="io.capyteam.rw-wasm-replacer"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'
+    BLUE=$'\033[1;34m'; MAGENTA=$'\033[1;35m'; CYAN=$'\033[1;36m'
+    WHITE=$'\033[1;37m'; GRAY=$'\033[0;90m'
+else
+    RESET=''; BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''
+    BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+fi
+
+log()  { printf '%b[INFO]%b %s\n' "$BLUE" "$RESET" "$*" | tee -a "$LOG_FILE"; }
+ok()   { printf '%b[ OK ]%b %s\n' "$GREEN" "$RESET" "$*" | tee -a "$LOG_FILE"; }
+warn() { printf '%b[WARN]%b %s\n' "$YELLOW" "$RESET" "$*" | tee -a "$LOG_FILE" >&2; }
+err()  { printf '%b[ERR ]%b %s\n' "$RED" "$RESET" "$*" | tee -a "$LOG_FILE" >&2; }
+die()  { err "$*"; exit 1; }
+
+on_error() {
+    local code=$? line=${BASH_LINENO[0]:-?}
+    err "Сбой на строке $line (код $code). База данных и Docker volumes не удалялись."
+    exit "$code"
+}
+trap on_error ERR
+
+require_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Запустите rw-wasm от root."
+}
+
+init_runtime() {
+    mkdir -p "$STATE_ROOT" "$CACHE_ROOT" "$BUILD_ROOT" "$BACKUP_ROOT" \
+        "$(dirname "$LOCK_FILE")" "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 700 "$STATE_ROOT" "$BACKUP_ROOT" || true
+    chmod 600 "$LOG_FILE" || true
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK_FILE"
+        flock -n 9 || die "Другой экземпляр rw-wasm уже выполняется."
+    fi
+}
+
+require_tools() {
+    local missing=() cmd
+    for cmd in docker curl tar python3 awk sed grep sort install mktemp sha256sum; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) || die "Не установлены команды: ${missing[*]}"
+    docker compose version >/dev/null 2>&1 || die "Не найден Docker Compose plugin."
+}
+
+pause() {
+    printf '\n%bНажмите Enter, чтобы вернуться в меню…%b' "$DIM" "$RESET"
+    read -r _ || true
+}
+
+confirm_yn() {
+    local prompt="$1" answer
+    while true; do
+        printf '%b%s [Y/N]: %b' "$BOLD" "$prompt" "$RESET"
+        read -r answer || return 1
+        case "${answer,,}" in
+            y|yes|д|да) return 0 ;;
+            n|no|н|нет) return 1 ;;
+            *) warn "Введите только Y или N." ;;
+        esac
+    done
+}
+
+prompt_value() {
+    local prompt="$1" default="${2:-}" value
+    if [[ -n "$default" ]]; then
+        printf '%b%s%b [%s]: ' "$BOLD" "$prompt" "$RESET" "$default" >&2
+    else
+        printf '%b%s%b: ' "$BOLD" "$prompt" "$RESET" >&2
+    fi
+    read -r value
+    printf '%s\n' "${value:-$default}"
+}
+
+prompt_secret() {
+    local prompt="$1" value
+    printf '%b%s%b: ' "$BOLD" "$prompt" "$RESET" >&2
+    read -r -s value
+    printf '\n' >&2
+    printf '%s' "$value"
+}
+
+normalize_version() {
+    printf '%s\n' "${1#v}"
+}
+
+version_gt() {
+    local a b
+    a="$(normalize_version "$1")"; b="$(normalize_version "$2")"
+    [[ "$a" != "$b" && "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
+}
+
+container_exists() {
+    docker inspect "$1" >/dev/null 2>&1
+}
+
+find_container_exact() {
+    local preferred="$1" pattern="$2"
+    if container_exists "$preferred"; then
+        printf '%s\n' "$preferred"
+        return 0
+    fi
+    docker ps -a --format '{{.Names}}' | grep -E "$pattern" | head -n1 || true
+}
+
+inspect_label() {
+    local container="$1" label="$2"
+    docker inspect "$container" --format "{{ index .Config.Labels \"$label\" }}" 2>/dev/null || true
+}
+
+image_label() {
+    local image="$1" label="$2"
+    docker image inspect "$image" --format "{{ index .Config.Labels \"$label\" }}" 2>/dev/null || true
+}
+
+find_working_dir() {
+    local container="$1" fallback="$2" value
+    value="$(inspect_label "$container" 'com.docker.compose.project.working_dir')"
+    [[ -n "$value" && "$value" != '<no value>' ]] || value="$fallback"
+    printf '%s\n' "$value"
+}
+
+find_service_name() {
+    local container="$1" fallback="$2" value
+    value="$(inspect_label "$container" 'com.docker.compose.service')"
+    [[ -n "$value" && "$value" != '<no value>' ]] || value="$fallback"
+    printf '%s\n' "$value"
+}
+
+find_compose_file() {
+    local container="$1" fallback_dir="$2" working files candidate
+    working="$(find_working_dir "$container" "$fallback_dir")"
+    files="$(inspect_label "$container" 'com.docker.compose.project.config_files')"
+
+    if [[ -n "$files" && "$files" != '<no value>' ]]; then
+        while IFS= read -r candidate; do
+            [[ -n "$candidate" ]] || continue
+            [[ "$candidate" = /* ]] || candidate="$working/$candidate"
+            [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+        done < <(printf '%s' "$files" | tr ',' '\n')
+    fi
+
+    for candidate in "$working/docker-compose.yml" "$working/docker-compose.yaml"; do
+        [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+container_env() {
+    local container="$1" key="$2"
+    docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+        | awk -F= -v key="$key" '$1==key {sub(/^[^=]*=/, ""); print; exit}'
+}
+
+read_dotenv() {
+    local file="$1" key="$2"
+    DOTENV_FILE="$file" DOTENV_KEY="$key" python3 <<'PY'
+from pathlib import Path
+import os
+path = Path(os.environ["DOTENV_FILE"])
+key = os.environ["DOTENV_KEY"]
+if path.exists():
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        current, value = stripped.split("=", 1)
+        if current == key:
+            print(value.strip().strip("'\""), end="")
+            break
+PY
+}
+
+write_dotenv() {
+    local file="$1" key="$2" value="$3"
+    DOTENV_FILE="$file" DOTENV_KEY="$key" DOTENV_VALUE="$value" python3 <<'PY'
+from pathlib import Path
+import os
+path = Path(os.environ["DOTENV_FILE"])
+key = os.environ["DOTENV_KEY"]
+value = os.environ["DOTENV_VALUE"]
+if "\n" in value or "\r" in value or "'" in value:
+    raise SystemExit(f"Недопустимое значение {key}")
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+result = []
+done = False
+for line in lines:
+    if line.lstrip().startswith(key + "="):
+        if not done:
+            result.append(f"{key}='{value}'")
+            done = True
+    else:
+        result.append(line)
+if not done:
+    if result and result[-1] != "":
+        result.append("")
+    result.append("# Remnawawe WASM Replacer by CapyTeam")
+    result.append(f"{key}='{value}'")
+path.write_text("\n".join(result) + "\n", encoding="utf-8")
+PY
+    chmod 600 "$file" || true
+}
+
+replace_service_image() {
+    local compose_file="$1" service="$2" image="$3"
+    COMPOSE_FILE="$compose_file" COMPOSE_SERVICE="$service" COMPOSE_IMAGE="$image" python3 <<'PY'
+from pathlib import Path
+import os
+import re
+
+path = Path(os.environ["COMPOSE_FILE"])
+service = os.environ["COMPOSE_SERVICE"]
+image = os.environ["COMPOSE_IMAGE"]
+lines = path.read_text(encoding="utf-8").splitlines()
+
+start = None
+service_indent = None
+pattern = re.compile(rf"^(?P<indent>\s*){re.escape(service)}:\s*(?:#.*)?$")
+for index, line in enumerate(lines):
+    match = pattern.match(line)
+    if match:
+        start = index
+        service_indent = len(match.group("indent"))
+        break
+if start is None:
+    raise SystemExit(f"Сервис {service} не найден в {path}")
+
+end = len(lines)
+for index in range(start + 1, len(lines)):
+    raw = lines[index]
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    if len(raw) - len(raw.lstrip()) <= service_indent:
+        end = index
+        break
+
+child_indent = " " * (service_indent + 2)
+for index in range(start + 1, end):
+    if re.match(r"^\s*image\s*:", lines[index]):
+        lines[index] = f"{child_indent}image: {image}"
+        break
+else:
+    lines.insert(start + 1, f"{child_indent}image: {image}")
+
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+}
+
+state_file() {
+    printf '%s/%s.env\n' "$STATE_ROOT" "$1"
+}
+
+save_state() {
+    local component="$1"
+    shift
+    local file tmp key value
+    file="$(state_file "$component")"
+    tmp="${file}.tmp"
+    : > "$tmp"
+    printf 'STATE_FORMAT=%q\n' 1 >> "$tmp"
+    while (($#)); do
+        key="$1"; value="$2"; shift 2
+        printf '%s=%q\n' "$key" "$value" >> "$tmp"
+    done
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$file"
+}
+
+load_state() {
+    local component="$1" file
+    file="$(state_file "$component")"
+    [[ -f "$file" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$file"
+}
+
+archive_state() {
+    local component="$1" file destination
+    file="$(state_file "$component")"
+    [[ -f "$file" ]] || return 0
+    destination="$BACKUP_ROOT/state-${component}-$(date +%Y%m%d-%H%M%S).env"
+    cp -a "$file" "$destination"
+    rm -f "$file"
+}
+
+backup_current_image() {
+    local component="$1" container="$2" timestamp image_id tag
+    timestamp="$(date +%Y%m%d%H%M%S)"
+    image_id="$(docker inspect "$container" --format '{{.Image}}')"
+    tag="local/capyteam/rw-wasm-backup/${component}:${timestamp}"
+    docker image tag "$image_id" "$tag"
+    printf '%s\n' "$tag"
+}
+
+panel_version() {
+    local container="$1" version image
+    version="$(container_env "$container" '__RW_METADATA_VERSION')"
+    if [[ -z "$version" ]]; then
+        image="$(docker inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)"
+        version="$(printf '%s' "$image" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n1 || true)"
+    fi
+    printf '%s\n' "${version:-неизвестна}"
+}
+
+editor_version() {
+    local container="$1" version image
+    image="$(docker inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)"
+    version="$(image_label "$image" "$LABEL_NS.upstream-version")"
+
+    if [[ -z "$version" ]]; then
+        version="$(docker exec "$container" sh -lc '
+            node -e "
+                const fs=require(\"fs\");
+                for (const p of [\"/app/package.json\",\"/app/backend/package.json\"]) {
+                    try {
+                        const v=JSON.parse(fs.readFileSync(p,\"utf8\")).version;
+                        if (v) { process.stdout.write(v); process.exit(0); }
+                    } catch {}
+                }
+            "
+        ' 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$version" ]]; then
+        version="$(printf '%s' "$image" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    fi
+
+    if [[ -z "$version" ]] && load_state editor 2>/dev/null; then
+        version="${UPSTREAM_VERSION:-}"
+    fi
+
+    printf '%s\n' "${version:-неизвестна}"
+}
+
+component_patch_version() {
+    local container="$1" image value
+    [[ -n "$container" ]] || return 0
+    image="$(docker inspect "$container" --format '{{.Config.Image}}' 2>/dev/null || true)"
+    value="$(image_label "$image" "$LABEL_NS.patch-version")"
+    if [[ -z "$value" && "$image" =~ (editor-sso|iframe-sso|editor-iframe|wasm) ]]; then
+        value="legacy"
+    fi
+    printf '%s\n' "$value"
+}
+
+wait_healthy() {
+    local container="$1" timeout="${2:-300}" started status health
+    started="$(date +%s)"
+    while true; do
+        status="$(docker inspect "$container" --format '{{.State.Status}}' 2>/dev/null || true)"
+        health="$(docker inspect "$container" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || true)"
+        if [[ "$status" == "running" && ( "$health" == "healthy" || "$health" == "none" ) ]]; then
+            return 0
+        fi
+        if (( $(date +%s) - started >= timeout )); then
+            docker logs --tail=200 "$container" >&2 || true
+            die "$container не стал healthy (status=$status, health=$health)."
+        fi
+        sleep 3
+    done
+}
+
+restart_reverse_proxy() {
+    local proxy
+    for proxy in remnawave-nginx nginx caddy; do
+        if container_exists "$proxy"; then
+            docker restart "$proxy" >/dev/null || true
+            sleep 3
+            return 0
+        fi
+    done
+}
+
+source_tag_download() {
+    local repo="$1" version="$2" destination="$3" tag archive
+    for tag in "$version" "v$version"; do
+        rm -rf "$destination"
+        mkdir -p "$destination"
+        archive="$(mktemp)"
+        if curl -fsSL --connect-timeout 10 --max-time 180 --retry 3 \
+            "https://codeload.github.com/${repo}/tar.gz/refs/tags/${tag}" -o "$archive" \
+            && tar -xzf "$archive" --strip-components=1 -C "$destination"; then
+            rm -f "$archive"
+            return 0
+        fi
+        rm -f "$archive"
+    done
+    return 1
+}
+
+download_panel_sources() {
+    local version="$1" root="$2"
+    log "Загружаю Remnawave frontend/backend $version…"
+    source_tag_download "$PANEL_FRONTEND_REPO" "$version" "$root/frontend" \
+        || die "Не удалось загрузить frontend $version."
+    source_tag_download "$PANEL_BACKEND_REPO" "$version" "$root/backend" \
+        || die "Не удалось загрузить backend $version."
+}
+
+download_editor_source() {
+    local version="$1" destination="$2"
+    log "Загружаю Xray UI Editor $version…"
+    source_tag_download "$EDITOR_REPO" "$version" "$destination" \
+        || die "Не удалось загрузить Editor $version."
+}
+
+patch_editor_source() {
+    local editor="$1"
+    EDITOR_SRC="$editor" python3 <<'PY'
+from pathlib import Path
+import os
+
+root = Path(os.environ["EDITOR_SRC"])
+
+def require(path: Path, needle: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    if needle not in text:
+        raise SystemExit(f"Не найден контрольный фрагмент в {path}: {needle!r}")
+    return text
+
+(root / "backend/src/auth/sso.ts").write_text(r'''import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import type { FastifyInstance, FastifyReply } from 'fastify'
+import { z } from 'zod'
+
+import type { AppConfig } from '../config.js'
+import { verifyPassword } from './password.js'
+import { SESSION_COOKIE } from './session.js'
+
+const TOKEN_TTL_SECONDS = 90
+
+const profilePath = z
+  .string()
+  .regex(
+    /^\/profiles\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    'Разрешён только путь профиля',
+  )
+
+const createTokenSchema = z.object({
+  password: z.string().min(1),
+  next: profilePath,
+})
+
+const consumeTokenSchema = z.object({
+  token: z.string().min(40).max(4096),
+})
+
+const payloadSchema = z.object({
+  next: profilePath,
+  exp: z.number().int().positive(),
+  nonce: z.string().min(16).max(128),
+})
+
+type SsoPayload = z.infer<typeof payloadSchema>
+
+function sign(encodedPayload: string, secret: string): string {
+  return createHmac('sha256', secret).update(encodedPayload).digest('base64url')
+}
+
+function makeToken(payload: SsoPayload, secret: string): string {
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
+  return `${encodedPayload}.${sign(encodedPayload, secret)}`
+}
+
+function readToken(token: string, secret: string): SsoPayload | null {
+  const parts = token.split('.')
+  if (parts.length !== 2) return null
+
+  const [encodedPayload, suppliedSignature] = parts
+  const expectedSignature = sign(encodedPayload, secret)
+  const supplied = Buffer.from(suppliedSignature)
+  const expected = Buffer.from(expectedSignature)
+
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    return null
+  }
+
+  try {
+    const payload = payloadSchema.parse(
+      JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8')),
+    )
+    if (payload.exp <= Math.floor(Date.now() / 1000)) return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+function setSessionCookie(reply: FastifyReply, config: AppConfig): void {
+  reply.setCookie(SESSION_COOKIE, String(Date.now()), {
+    signed: true,
+    httpOnly: true,
+    sameSite: 'none',
+    secure: true,
+    path: '/',
+    maxAge: config.sessionTtlSeconds,
+  })
+}
+
+export async function registerSsoRoutes(app: FastifyInstance, config: AppConfig): Promise<void> {
+  app.post(
+    '/api/auth/sso/token',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const { password, next } = createTokenSchema.parse(req.body)
+      if (!(await verifyPassword(password, config.appPassword))) {
+        return reply.status(401).send({ message: 'Неверный пароль' })
+      }
+
+      const now = Math.floor(Date.now() / 1000)
+      const token = makeToken(
+        {
+          next,
+          exp: now + TOKEN_TTL_SECONDS,
+          nonce: randomBytes(18).toString('base64url'),
+        },
+        config.sessionSecret,
+      )
+
+      reply.header('Cache-Control', 'no-store')
+      return { token, expiresIn: TOKEN_TTL_SECONDS }
+    },
+  )
+
+  app.get(
+    '/api/auth/sso/consume',
+    { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const { token } = consumeTokenSchema.parse(req.query)
+      const payload = readToken(token, config.sessionSecret)
+
+      if (!payload) {
+        return reply.status(401).send({ message: 'SSO-токен недействителен или истёк' })
+      }
+
+      reply.header('Cache-Control', 'no-store')
+      reply.header('Referrer-Policy', 'no-referrer')
+      setSessionCookie(reply, config)
+      return reply.redirect(payload.next)
+    },
+  )
+}
+''', encoding="utf-8")
+
+routes_path = root / "backend/src/auth/routes.ts"
+routes = require(routes_path, "import { SESSION_COOKIE } from './session.js'")
+if "import { registerSsoRoutes } from './sso.js'" not in routes:
+    routes = routes.replace(
+        "import { SESSION_COOKIE } from './session.js'",
+        "import { SESSION_COOKIE } from './session.js'\nimport { registerSsoRoutes } from './sso.js'",
+        1,
+    )
+anchor = "export const authRoutes: FastifyPluginAsync<{ config: AppConfig }> = async (app, opts) => {"
+if "await registerSsoRoutes(app, opts.config)" not in routes:
+    routes = routes.replace(anchor, anchor + "\n  await registerSsoRoutes(app, opts.config)", 1)
+routes_path.write_text(routes, encoding="utf-8")
+
+guard_path = root / "backend/src/auth/guard.ts"
+guard = require(guard_path, "const PUBLIC_API_PATHS = ['/api/auth/login']")
+guard = guard.replace(
+    "const PUBLIC_API_PATHS = ['/api/auth/login']",
+    '''const PUBLIC_API_PATHS = [
+  '/api/auth/login',
+  '/api/auth/sso/token',
+  '/api/auth/sso/consume',
+]''',
+    1,
+)
+guard_path.write_text(guard, encoding="utf-8")
+
+server_path = root / "backend/src/server.ts"
+server = require(server_path, "const app = Fastify({ logger: process.env.NODE_ENV !== 'test' })")
+if "XRAY_EDITOR_FRAME_ANCESTOR" not in server:
+    anchor = "  const app = Fastify({ logger: process.env.NODE_ENV !== 'test' })"
+    addition = r'''
+  const frameAncestorRaw = process.env.XRAY_EDITOR_FRAME_ANCESTOR?.trim()
+  if (frameAncestorRaw) {
+    let frameAncestor: string
+    try {
+      const parsed = new URL(frameAncestorRaw)
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new Error('unsupported protocol')
+      }
+      frameAncestor = parsed.origin
+    } catch {
+      throw new Error('XRAY_EDITOR_FRAME_ANCESTOR должен быть корректным HTTP(S) origin')
+    }
+
+    app.addHook('onSend', async (_req, reply, payload) => {
+      reply.header('Content-Security-Policy', `frame-ancestors 'self' ${frameAncestor}`)
+      return payload
+    })
+  }
+'''
+    server = server.replace(anchor, anchor + addition, 1)
+server_path.write_text(server, encoding="utf-8")
+
+
+page_path = root / "frontend/src/features/editor/EditorPage.tsx"
+page = require(page_path, "function EditorInner({ profile }: { profile: Profile })")
+
+old_inner = """function EditorInner({ profile }: { profile: Profile }) {
+  const navigate = useNavigate()
+"""
+new_inner = """function EditorInner({ profile }: { profile: Profile }) {
+  const navigate = useNavigate()
+  const embedded = window.self !== window.top
+"""
+if new_inner not in page:
+    if old_inner not in page:
+        raise SystemExit("Не найден EditorInner/useNavigate anchor")
+    page = page.replace(old_inner, new_inner, 1)
+
+if "className={embedded ? 'workbench workbench-embedded' : 'workbench'}" not in page:
+    if '<div className="workbench">' not in page:
+        raise SystemExit("Не найден workbench div")
+    page = page.replace(
+        '<div className="workbench">',
+        "<div className={embedded ? 'workbench workbench-embedded' : 'workbench'}>",
+        1,
+    )
+
+old_header = """      <header className="wb-topbar">
+        <Button variant="ghost" onClick={() => navigate('/')}>
+          ← Профили
+        </Button>
+        <div className="wb-title">
+          <h1>{profile.name}</h1>
+          <span className="eyebrow">обновлён {relativeTime(profile.updatedAt)}</span>
+        </div>
+"""
+new_header = """      <header className="wb-topbar">
+        {!embedded && (
+          <>
+            <Button variant="ghost" onClick={() => navigate('/')}>
+              ← Профили
+            </Button>
+            <div className="wb-title">
+              <h1>{profile.name}</h1>
+              <span className="eyebrow">обновлён {relativeTime(profile.updatedAt)}</span>
+            </div>
+          </>
+        )}
+"""
+if new_header not in page:
+    if old_header not in page:
+        raise SystemExit("Не найден блок Профили/название Editor")
+    page = page.replace(old_header, new_header, 1)
+
+page_path.write_text(page, encoding="utf-8")
+
+css_path = root / "frontend/src/shared/ui/tokens.css"
+css = css_path.read_text(encoding="utf-8")
+css_marker = "/* CapyTeam embedded UI */"
+if css_marker not in css:
+    css += r"""
+
+/* CapyTeam embedded UI */
+.workbench-embedded .wb-topbar {
+  width: 100%;
+  height: auto;
+  min-height: 52px;
+  padding: 6px 10px;
+  gap: 6px;
+  overflow: visible;
+  flex-wrap: wrap;
+  align-content: center;
+  justify-content: center !important;
+}
+
+.workbench-embedded .wb-topbar > * {
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+}
+
+.workbench-embedded .wb-topbar > .spacer {
+  display: none !important;
+}
+
+.workbench-embedded .wb-topbar .btn {
+  padding: 5px 8px;
+}
+
+.workbench-embedded .wb-topbar .segmented .btn {
+  padding: 4px 9px;
+}
+
+.workbench-embedded .wb-topbar .wb-iconbar,
+.workbench-embedded .wb-topbar .segmented {
+  flex: none;
+  justify-content: center;
+}
+
+.workbench-embedded .wb-stage,
+.workbench-embedded .wb-canvas {
+  min-width: 0;
+  max-width: 100%;
+}
+
+@media (max-width: 980px) {
+  .workbench-embedded .wb-topbar {
+    gap: 4px;
+    padding: 5px 7px;
+    justify-content: center !important;
+  }
+
+  .workbench-embedded .wb-topbar .btn {
+    padding-inline: 7px;
+    font-size: var(--t-sm);
+  }
+}
+"""
+    css_path.write_text(css, encoding="utf-8")
+
+print("Editor iframe SSO patch applied")
+PY
+}
+
+
+patch_panel_source() {
+    local frontend="$1" backend="$2"
+    FRONTEND_SRC="$frontend" BACKEND_SRC="$backend" python3 <<'PY'
+from pathlib import Path
+import os
+
+frontend = Path(os.environ["FRONTEND_SRC"])
+backend = Path(os.environ["BACKEND_SRC"])
+
+def require(path: Path, needle: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    if needle not in text:
+        raise SystemExit(f"Не найден контрольный фрагмент в {path}: {needle!r}")
+    return text
+
+module_dir = backend / "src/modules/editor-sso"
+module_dir.mkdir(parents=True, exist_ok=True)
+
+(module_dir / "editor-sso.controller.ts").write_text(r'''import {
+    Body,
+    Controller,
+    HttpException,
+    HttpStatus,
+    Post,
+    UseFilters,
+    UseGuards,
+} from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+
+import { Roles } from '@common/decorators/roles/roles';
+import { HttpExceptionFilter } from '@common/exception/http-exception.filter';
+import { JwtDefaultGuard } from '@common/guards/jwt-guards/def-jwt-guard';
+import { RolesGuard } from '@common/guards/roles';
+import { ROLE } from '@libs/contracts/constants';
+
+const PROFILE_UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+interface EmbedEditorBody {
+    profileUuid?: string;
+}
+
+interface EditorTokenResponse {
+    token?: unknown;
+    message?: unknown;
+}
+
+@ApiBearerAuth('Authorization')
+@ApiTags('Embedded Xray Editor SSO')
+@Roles(ROLE.ADMIN)
+@UseGuards(JwtDefaultGuard, RolesGuard)
+@UseFilters(HttpExceptionFilter)
+@Controller('editor-sso')
+export class EditorSsoController {
+    @Post('embed')
+    async createEmbedUrl(
+        @Body() body: EmbedEditorBody,
+    ): Promise<{ embedUrl: string; openUrl: string }> {
+        const profileUuid = body.profileUuid?.trim();
+        if (!profileUuid || !PROFILE_UUID_RE.test(profileUuid)) {
+            throw new HttpException('Некорректный UUID профиля', HttpStatus.BAD_REQUEST);
+        }
+
+        const editorUrlRaw = process.env.XRAY_EDITOR_URL?.trim();
+        const editorPassword = process.env.XRAY_EDITOR_PASSWORD;
+        if (!editorUrlRaw || !editorPassword) {
+            throw new HttpException(
+                'XRAY_EDITOR_URL или XRAY_EDITOR_PASSWORD не настроены',
+                HttpStatus.SERVICE_UNAVAILABLE,
+            );
+        }
+
+        let editorUrl: URL;
+        try {
+            editorUrl = new URL(editorUrlRaw);
+        } catch {
+            throw new HttpException('XRAY_EDITOR_URL некорректен', HttpStatus.SERVICE_UNAVAILABLE);
+        }
+        if (editorUrl.protocol !== 'https:') {
+            throw new HttpException(
+                'XRAY_EDITOR_URL должен использовать HTTPS',
+                HttpStatus.SERVICE_UNAVAILABLE,
+            );
+        }
+
+        editorUrl.pathname = editorUrl.pathname.replace(/\/+$/, '');
+        editorUrl.search = '';
+        editorUrl.hash = '';
+        const baseUrl = editorUrl.toString().replace(/\/+$/, '');
+        const profilePath = `/profiles/${profileUuid}`;
+
+        let response: Response;
+        try {
+            response = await fetch(`${baseUrl}/api/auth/sso/token`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                    password: editorPassword,
+                    next: profilePath,
+                }),
+                signal: AbortSignal.timeout(10_000),
+            });
+        } catch {
+            throw new HttpException('Внешний редактор недоступен', HttpStatus.BAD_GATEWAY);
+        }
+
+        const payload = (await response.json().catch(() => null)) as EditorTokenResponse | null;
+        if (!response.ok || typeof payload?.token !== 'string') {
+            const details = typeof payload?.message === 'string' ? `: ${payload.message}` : '';
+            throw new HttpException(
+                `Editor отклонил SSO-запрос${details}`,
+                HttpStatus.BAD_GATEWAY,
+            );
+        }
+
+        return {
+            embedUrl: `${baseUrl}/api/auth/sso/consume?token=${encodeURIComponent(payload.token)}`,
+            openUrl: `${baseUrl}${profilePath}`,
+        };
+    }
+}
+''', encoding="utf-8")
+
+(module_dir / "editor-sso.module.ts").write_text(r'''import { Module } from '@nestjs/common';
+import { CqrsModule } from '@nestjs/cqrs';
+
+import { EditorSsoController } from './editor-sso.controller';
+
+@Module({
+    imports: [CqrsModule],
+    controllers: [EditorSsoController],
+})
+export class EditorSsoModule {}
+''', encoding="utf-8")
+
+modules_path = backend / "src/modules/remnawave-backend.modules.ts"
+modules = require(
+    modules_path,
+    "import { ConfigProfileModule } from './config-profiles/config-profile.module';",
+)
+if "import { EditorSsoModule } from './editor-sso/editor-sso.module';" not in modules:
+    modules = modules.replace(
+        "import { ConfigProfileModule } from './config-profiles/config-profile.module';",
+        "import { ConfigProfileModule } from './config-profiles/config-profile.module';\n"
+        "import { EditorSsoModule } from './editor-sso/editor-sso.module';",
+        1,
+    )
+if "ConditionalModule.registerWhen(EditorSsoModule" not in modules:
+    modules = modules.replace(
+        "        ConfigProfileModule,",
+        "        ConfigProfileModule,\n"
+        "        ConditionalModule.registerWhen(EditorSsoModule, () => isRestApi()),",
+        1,
+    )
+modules_path.write_text(modules, encoding="utf-8")
+
+external_dir = frontend / "src/shared/external-profile-editor"
+external_dir.mkdir(parents=True, exist_ok=True)
+
+(external_dir / "preference.ts").write_text(r'''import { useCallback, useState } from 'react'
+
+export const EXTERNAL_PROFILE_EDITOR_STORAGE_KEY =
+    'remnawave.external-profile-editor.enabled'
+
+export const isExternalProfileEditorEnabled = (): boolean => {
+    try {
+        return window.localStorage.getItem(EXTERNAL_PROFILE_EDITOR_STORAGE_KEY) === 'true'
+    } catch {
+        return false
+    }
+}
+
+export const useExternalProfileEditorPreference = () => {
+    const [enabled, setEnabledState] = useState(isExternalProfileEditorEnabled)
+
+    const setEnabled = useCallback((value: boolean) => {
+        try {
+            window.localStorage.setItem(
+                EXTERNAL_PROFILE_EDITOR_STORAGE_KEY,
+                value ? 'true' : 'false'
+            )
+        } finally {
+            setEnabledState(value)
+        }
+    }, [])
+
+    return { enabled, setEnabled }
+}
+''', encoding="utf-8")
+
+(external_dir / "external-profile-editor-frame.tsx").write_text(r'''import {
+    Alert,
+    Box,
+    Button,
+    Center,
+    Group,
+    Loader,
+    Stack,
+    Text
+} from '@mantine/core'
+import { useEffect, useState, type ReactNode } from 'react'
+import { TbAlertTriangle, TbExternalLink, TbRefresh } from 'react-icons/tb'
+
+import { instance } from '@shared/api'
+
+import {
+    EXTERNAL_PROFILE_EDITOR_STORAGE_KEY,
+    isExternalProfileEditorEnabled
+} from './preference'
+
+interface Props {
+    children: ReactNode
+    profileUuid: string
+}
+
+interface EmbedResponse {
+    embedUrl: string
+    openUrl: string
+}
+
+export const ExternalProfileEditorFrame = ({ children, profileUuid }: Props) => {
+    const enabled = isExternalProfileEditorEnabled()
+    const [embedUrl, setEmbedUrl] = useState<string | null>(null)
+    const [openUrl, setOpenUrl] = useState<string | null>(null)
+    const [error, setError] = useState<string | null>(null)
+    const [frameLoading, setFrameLoading] = useState(true)
+    const [frameKey, setFrameKey] = useState(0)
+
+    useEffect(() => {
+        if (!enabled) return
+
+        let active = true
+        const load = async () => {
+            try {
+                setError(null)
+                setFrameLoading(true)
+                const { data } = await instance.post<EmbedResponse>('/api/editor-sso/embed', {
+                    profileUuid
+                })
+                if (
+                    !data?.embedUrl?.startsWith('https://') ||
+                    !data?.openUrl?.startsWith('https://')
+                ) {
+                    throw new Error('Сервер вернул некорректный URL Editor')
+                }
+                if (active) {
+                    setEmbedUrl(data.embedUrl)
+                    setOpenUrl(data.openUrl)
+                }
+            } catch (cause) {
+                if (!active) return
+                setError(
+                    cause instanceof Error
+                        ? cause.message
+                        : 'Не удалось подготовить встроенный Editor'
+                )
+            }
+        }
+
+        void load()
+        return () => {
+            active = false
+        }
+    }, [enabled, profileUuid, frameKey])
+
+    if (!enabled) return children
+
+    if (error) {
+        return (
+            <Center mih={420}>
+                <Alert
+                    color="yellow"
+                    icon={<TbAlertTriangle size={20} />}
+                    title="Внешний редактор недоступен"
+                >
+                    <Stack gap="xs">
+                        <Text size="sm">{error}</Text>
+                        <Group gap="xs">
+                            <Button
+                                leftSection={<TbRefresh size={16} />}
+                                onClick={() => setFrameKey((value) => value + 1)}
+                                size="xs"
+                                variant="light"
+                            >
+                                Повторить
+                            </Button>
+                            <Button
+                                onClick={() => {
+                                    window.localStorage.setItem(
+                                        EXTERNAL_PROFILE_EDITOR_STORAGE_KEY,
+                                        'false'
+                                    )
+                                    window.location.reload()
+                                }}
+                                size="xs"
+                                variant="default"
+                            >
+                                Вернуться к встроенному WASM
+                            </Button>
+                        </Group>
+                    </Stack>
+                </Alert>
+            </Center>
+        )
+    }
+
+    if (!embedUrl) {
+        return (
+            <Center mih={420}>
+                <Stack align="center" gap="sm">
+                    <Loader />
+                    <Text c="dimmed" size="sm">
+                        Подготавливается встроенный Xray UI Editor…
+                    </Text>
+                </Stack>
+            </Center>
+        )
+    }
+
+    return (
+        <Stack gap="xs">
+            <Group justify="space-between">
+                <Text c="dimmed" size="sm">
+                    Xray UI Editor
+                </Text>
+                <Group gap="xs">
+                    <Button
+                        leftSection={<TbRefresh size={16} />}
+                        onClick={() => setFrameKey((value) => value + 1)}
+                        size="xs"
+                        variant="subtle"
+                    >
+                        Перезагрузить
+                    </Button>
+                    {openUrl && (
+                        <Button
+                            component="a"
+                            href={openUrl}
+                            leftSection={<TbExternalLink size={16} />}
+                            rel="noopener noreferrer"
+                            size="xs"
+                            target="_blank"
+                            variant="subtle"
+                        >
+                            Открыть отдельно
+                        </Button>
+                    )}
+                </Group>
+            </Group>
+
+            <Box
+                pos="relative"
+                style={{
+                    minHeight: '620px',
+                    height: 'calc(100vh - 245px)',
+                    overflow: 'hidden',
+                    border: '1px solid var(--mantine-color-default-border)',
+                    borderRadius: 'var(--mantine-radius-md)'
+                }}
+            >
+                {frameLoading && (
+                    <Center
+                        pos="absolute"
+                        style={{ inset: 0, zIndex: 1 }}
+                    >
+                        <Stack align="center" gap="sm">
+                            <Loader />
+                            <Text c="dimmed" size="sm">
+                                Editor загружается…
+                            </Text>
+                        </Stack>
+                    </Center>
+                )}
+
+                <iframe
+                    allow="clipboard-read; clipboard-write"
+                    key={`${embedUrl}-${frameKey}`}
+                    onLoad={() => setFrameLoading(false)}
+                    referrerPolicy="no-referrer"
+                    src={embedUrl}
+                    style={{
+                        width: '100%',
+                        height: '100%',
+                        border: 0,
+                        background: 'transparent'
+                    }}
+                    title={`Xray UI Editor — ${profileUuid}`}
+                />
+            </Box>
+        </Stack>
+    )
+}
+''', encoding="utf-8")
+
+profile_path = frontend / "src/pages/dashboard/config-profiles/components/config-profile-by-uuid.page.component.tsx"
+profile = require(
+    profile_path,
+    "import { ConfigEditorWidget } from '@widgets/dashboard/config-profiles/config-editor/config-editor.widget'",
+)
+if "external-profile-editor-frame" not in profile:
+    profile = profile.replace(
+        "import { ROUTES } from '@shared/constants'",
+        "import { ROUTES } from '@shared/constants'\n"
+        "import { ExternalProfileEditorFrame } from "
+        "'@shared/external-profile-editor/external-profile-editor-frame'",
+        1,
+    )
+
+desktop = '''                            <ConfigEditorWidget
+                                configProfile={configProfile}
+                                isWasmCrashed={isWasmCrashed}
+                                isWasmRestarting={isWasmRestarting}
+                                onRestartWasm={onRestartWasm}
+                                snippets={snippets}
+                            />'''
+wrapped = '''                            <ExternalProfileEditorFrame profileUuid={configProfile.uuid}>
+                                <ConfigEditorWidget
+                                    configProfile={configProfile}
+                                    isWasmCrashed={isWasmCrashed}
+                                    isWasmRestarting={isWasmRestarting}
+                                    onRestartWasm={onRestartWasm}
+                                    snippets={snippets}
+                                />
+                            </ExternalProfileEditorFrame>'''
+if wrapped not in profile:
+    position = profile.rfind(desktop)
+    if position < 0:
+        raise SystemExit("Десктопный ConfigEditorWidget не найден")
+    profile = profile[:position] + wrapped + profile[position + len(desktop):]
+profile_path.write_text(profile, encoding="utf-8")
+
+connector_path = frontend / "src/pages/dashboard/config-profiles/connectors/config-profile-by-uuid.page.connector.tsx"
+connector = require(connector_path, "import { ROUTES } from '@shared/constants'")
+if "isExternalProfileEditorEnabled" not in connector:
+    connector = connector.replace(
+        "import { ROUTES } from '@shared/constants'",
+        "import { ROUTES } from '@shared/constants'\n"
+        "import { isExternalProfileEditorEnabled } from "
+        "'@shared/external-profile-editor/preference'",
+        1,
+    )
+
+if "const useExternalEditor =" not in connector:
+    connector = connector.replace(
+        "    const { uuid } = useParams()\n",
+        '''    const { uuid } = useParams()
+
+    const useExternalEditor =
+        isExternalProfileEditorEnabled() &&
+        window.matchMedia('(min-width: 1201px)').matches
+''',
+        1,
+    )
+
+old_effect = '''    useLayoutEffect(() => {
+        initWasm()
+
+        return () => {
+            delete window.onWasmInitialized
+        }
+    }, [])
+'''
+new_effect = '''    useLayoutEffect(() => {
+        if (useExternalEditor) {
+            setIsLoading(false)
+            return
+        }
+
+        initWasm()
+
+        return () => {
+            delete window.onWasmInitialized
+        }
+    }, [initWasm, useExternalEditor])
+'''
+if new_effect not in connector:
+    connector = connector.replace(old_effect, new_effect, 1)
+
+old_gate = '''    if (isLoading || isConfigProfileLoading || !configProfile || isSnippetsLoading || !snippets) {
+        return <LoadingScreen text="WASM module is loading..." value={downloadProgress} />
+    }
+'''
+new_gate = '''    if (
+        (!useExternalEditor && isLoading) ||
+        isConfigProfileLoading ||
+        !configProfile ||
+        isSnippetsLoading ||
+        !snippets
+    ) {
+        return (
+            <LoadingScreen
+                text={useExternalEditor ? 'Profile is loading...' : 'WASM module is loading...'}
+                value={useExternalEditor ? undefined : downloadProgress}
+            />
+        )
+    }
+'''
+if new_gate not in connector:
+    connector = connector.replace(old_gate, new_gate, 1)
+connector_path.write_text(connector, encoding="utf-8")
+
+visual_path = frontend / "src/widgets/remnawave-settings/visual-settings-card/visual-settings-card.widget.tsx"
+visual = require(visual_path, "import { Group, SegmentedControl, Stack } from '@mantine/core'")
+visual = visual.replace(
+    "import { Group, SegmentedControl, Stack } from '@mantine/core'",
+    "import { Group, SegmentedControl, Stack, Switch } from '@mantine/core'",
+    1,
+)
+if "useExternalProfileEditorPreference" not in visual:
+    visual = visual.replace(
+        "import { useIsMobile } from '@shared/hooks'",
+        "import { useExternalProfileEditorPreference } from "
+        "'@shared/external-profile-editor/preference'\n"
+        "import { useIsMobile } from '@shared/hooks'",
+        1,
+    )
+if "externalEditorEnabled" not in visual:
+    visual = visual.replace(
+        "    const toggleLayoutStyle = useToggleLayoutStyleAction()",
+        '''    const toggleLayoutStyle = useToggleLayoutStyleAction()
+    const { enabled: externalEditorEnabled, setEnabled: setExternalEditorEnabled } =
+        useExternalProfileEditorPreference()''',
+        1,
+    )
+
+switch = '''                    <Switch
+                        checked={externalEditorEnabled}
+                        description="Встраивает Xray UI Editor вместо WASM только на компьютере. Настройка хранится в этом браузере."
+                        label="Внешний редактор конфигурационных профилей"
+                        onChange={(event) =>
+                            setExternalEditorEnabled(event.currentTarget.checked)
+                        }
+                    />'''
+if switch not in visual:
+    anchor = '''                        value={layoutStyle}
+                    />'''
+    visual = visual.replace(anchor, anchor + "\n" + switch, 1)
+visual_path.write_text(visual, encoding="utf-8")
+
+
+frame_path = frontend / "src/shared/external-profile-editor/external-profile-editor-frame.tsx"
+frame = frame_path.read_text(encoding="utf-8")
+
+old_frame_header = """    return (
+        <Stack gap="xs">
+            <Group justify="space-between">
+                <Text c="dimmed" size="sm">
+                    Xray UI Editor
+                </Text>
+                <Group gap="xs">
+"""
+new_frame_header = """    return (
+        <Stack
+            gap="xs"
+            style={{ width: '100%', maxWidth: '100%', minWidth: 0 }}
+        >
+            <Group justify="flex-end" gap="xs">
+"""
+if new_frame_header not in frame:
+    if old_frame_header not in frame:
+        raise SystemExit("Не найден заголовок iframe-компонента")
+    frame = frame.replace(old_frame_header, new_frame_header, 1)
+
+old_toolbar_end = """                    )}
+                </Group>
+            </Group>
+
+            <Box
+"""
+new_toolbar_end = """                    )}
+            </Group>
+
+            <Box
+"""
+if new_toolbar_end not in frame:
+    if old_toolbar_end not in frame:
+        raise SystemExit("Не найден конец toolbar iframe-компонента")
+    frame = frame.replace(old_toolbar_end, new_toolbar_end, 1)
+
+old_box = """                style={{
+                    minHeight: '620px',
+                    height: 'calc(100vh - 245px)',
+                    overflow: 'hidden',
+"""
+new_box = """                style={{
+                    width: '100%',
+                    maxWidth: '100%',
+                    minWidth: 0,
+                    minHeight: '620px',
+                    height: 'calc(100vh - 245px)',
+                    overflow: 'hidden',
+"""
+if new_box not in frame:
+    if old_box not in frame:
+        raise SystemExit("Не найден style Box iframe")
+    frame = frame.replace(old_box, new_box, 1)
+
+old_iframe = """                    style={{
+                        width: '100%',
+                        height: '100%',
+                        border: 0,
+"""
+new_iframe = """                    style={{
+                        display: 'block',
+                        width: '100%',
+                        maxWidth: '100%',
+                        minWidth: 0,
+                        height: '100%',
+                        border: 0,
+"""
+if new_iframe not in frame:
+    if old_iframe not in frame:
+        raise SystemExit("Не найден style iframe")
+    frame = frame.replace(old_iframe, new_iframe, 1)
+
+frame_path.write_text(frame, encoding="utf-8")
+
+# Add Editor to Remnawave's Helmet CSP. This removes the need for a manual nginx edit.
+csp_candidates = []
+for candidate in backend.rglob("*.ts"):
+    source = candidate.read_text(encoding="utf-8", errors="ignore")
+    if (
+        "contentSecurityPolicy" in source
+        and "directives" in source
+        and "raw.githubusercontent.com" in source
+        and "ungh.cc" in source
+    ):
+        csp_candidates.append((candidate, source))
+
+if len(csp_candidates) != 1:
+    raise SystemExit(
+        f"Ожидался один CSP-конфиг Remnawave, найдено: {len(csp_candidates)}"
+    )
+
+csp_path, csp = csp_candidates[0]
+if "XRAY_EDITOR_URL" not in csp or "'frame-src'" not in csp:
+    anchor = "directives: {"
+    if anchor not in csp:
+        raise SystemExit(f"Не найден directives anchor в {csp_path}")
+    csp = csp.replace(
+        anchor,
+        anchor
+        + "\n                    'frame-src': [\"'self'\", process.env.XRAY_EDITOR_URL!],",
+        1,
+    )
+    csp_path.write_text(csp, encoding="utf-8")
+
+
+dockerfile = (backend / "Dockerfile").read_text(encoding="utf-8")
+import re
+match = re.search(r"^FROM node:[^\n]+ AS backend-build$", dockerfile, re.MULTILINE)
+if not match:
+    raise SystemExit("Не найден backend-build stage в Dockerfile")
+marker = match.group(0)
+_, rest = dockerfile.split(marker, 1)
+
+frontend_stage = r'''FROM alpine:3.19 AS frontend
+WORKDIR /opt/frontend
+
+ARG BRANCH=main
+COPY patched-frontend-dist ./frontend_temp/dist
+RUN apk add --no-cache curl ca-certificates \
+    && mkdir -p frontend_temp/dist/assets \
+    && curl -fL https://validator.remna.dev/wasm_exec.js -o frontend_temp/dist/assets/wasm_exec.js \
+    && curl -fL https://validator.remna.dev/xray.schema.json -o frontend_temp/dist/assets/xray.schema.json \
+    && curl -fL https://validator.remna.dev/xray.schema.cn.json -o frontend_temp/dist/assets/xray.schema.cn.json \
+    && curl -fL https://validator.remna.dev/main.wasm -o frontend_temp/dist/assets/main.wasm
+'''
+
+(backend / "Dockerfile.editor-iframe").write_text(
+    frontend_stage + marker + rest,
+    encoding="utf-8",
+)
+
+print("Remnawave iframe patch applied")
+PY
+}
+
+
+
+github_api_get() {
+    local repo="$1" endpoint="$2" destination="$3"
+    local -a headers
+    headers=(
+        -H 'Accept: application/vnd.github+json'
+        -H 'X-GitHub-Api-Version: 2022-11-28'
+        -H 'User-Agent: rw-wasm-replacer'
+    )
+    [[ -n "${GITHUB_TOKEN:-}" ]] && headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    curl -fsSL --connect-timeout 8 --max-time 20 --retry 2 "${headers[@]}" \
+        "https://api.github.com/repos/${repo}/${endpoint}" -o "$destination"
+}
+
+github_release() {
+    github_api_get "$1" 'releases/latest' "$2"
+}
+
+github_latest_tag() {
+    local repo="$1" destination="$2" tags_file code
+    tags_file="$(mktemp)"
+
+    if ! github_api_get "$repo" 'tags?per_page=100' "$tags_file"; then
+        rm -f "$tags_file"
+        return 1
+    fi
+
+    TAGS_FILE="$tags_file" python3 <<'PY_TAGS' > "$destination"
+import json
+import os
+import re
+
+try:
+    with open(os.environ["TAGS_FILE"], encoding="utf-8") as handle:
+        tags = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+
+versions = []
+for item in tags:
+    name = str(item.get("name", ""))
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", name)
+    if match:
+        versions.append((tuple(map(int, match.groups())), name))
+
+if not versions:
+    raise SystemExit(1)
+
+_, name = max(versions)
+print(name, end="")
+PY_TAGS
+    code=$?
+    rm -f "$tags_file"
+    return "$code"
+}
+
+release_field() {
+    local file="$1" field="$2"
+    RELEASE_FILE="$file" RELEASE_FIELD="$field" python3 <<'PY'
+import json
+import os
+
+try:
+    with open(os.environ["RELEASE_FILE"], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+
+value = data.get(os.environ["RELEASE_FIELD"], "")
+if value is None:
+    value = ""
+print(value, end="")
+PY
+}
+
+release_asset_url() {
+    local file="$1" name="$2"
+    RELEASE_FILE="$file" ASSET_NAME="$name" python3 <<'PY'
+import json
+import os
+
+try:
+    with open(os.environ["RELEASE_FILE"], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+
+for asset in data.get("assets", []):
+    if asset.get("name") == os.environ["ASSET_NAME"]:
+        print(asset.get("browser_download_url", ""), end="")
+        break
+PY
+}
+
+SCRIPT_UPDATE_AVAILABLE=0
+SCRIPT_LATEST_VERSION=""
+SCRIPT_RELEASE_FILE="$CACHE_ROOT/script-release.json"
+
+PANEL_UPDATE_AVAILABLE=0
+PANEL_LATEST_VERSION=""
+PANEL_LATEST_COMPATIBLE=0
+PANEL_RELEASE_FILE="$CACHE_ROOT/panel-release.json"
+
+EDITOR_LATEST_VERSION=""
+
+check_patch_compatibility_panel() {
+    local version="$1" root="$CACHE_ROOT/compat-panel-$version"
+    rm -rf "$root"
+    mkdir -p "$root"
+
+    source_tag_download "$PANEL_FRONTEND_REPO" "$version" "$root/frontend" || {
+        rm -rf "$root"
+        return 1
+    }
+    source_tag_download "$PANEL_BACKEND_REPO" "$version" "$root/backend" || {
+        rm -rf "$root"
+        return 1
+    }
+
+    if patch_panel_source "$root/frontend" "$root/backend" >/dev/null 2>&1; then
+        rm -rf "$root"
+        return 0
+    fi
+
+    rm -rf "$root"
+    return 1
+}
+
+check_patch_compatibility_editor() {
+    local version="$1" root="$CACHE_ROOT/compat-editor-$version"
+    rm -rf "$root"
+    mkdir -p "$root"
+
+    source_tag_download "$EDITOR_REPO" "$version" "$root" || {
+        rm -rf "$root"
+        return 1
+    }
+
+    if patch_editor_source "$root" >/dev/null 2>&1; then
+        rm -rf "$root"
+        return 0
+    fi
+
+    rm -rf "$root"
+    return 1
+}
+
+check_updates() {
+    SCRIPT_UPDATE_AVAILABLE=0
+    PANEL_UPDATE_AVAILABLE=0
+    PANEL_LATEST_COMPATIBLE=0
+
+    if [[ "${RW_WASM_OFFLINE:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    if github_release "$SCRIPT_REPO" "$SCRIPT_RELEASE_FILE" 2>/dev/null; then
+        SCRIPT_LATEST_VERSION="$(normalize_version "$(release_field "$SCRIPT_RELEASE_FILE" tag_name)")"
+        if [[ -n "$SCRIPT_LATEST_VERSION" ]] && version_gt "$SCRIPT_LATEST_VERSION" "$SCRIPT_VERSION"; then
+            SCRIPT_UPDATE_AVAILABLE=1
+        fi
+    fi
+
+    if github_release "$PANEL_BACKEND_REPO" "$PANEL_RELEASE_FILE" 2>/dev/null; then
+        PANEL_LATEST_VERSION="$(normalize_version "$(release_field "$PANEL_RELEASE_FILE" tag_name)")"
+    fi
+    if [[ -z "$PANEL_LATEST_VERSION" ]]; then
+        local panel_tag_file="$CACHE_ROOT/panel-latest-tag.txt"
+        if github_latest_tag "$PANEL_BACKEND_REPO" "$panel_tag_file" 2>/dev/null; then
+            PANEL_LATEST_VERSION="$(normalize_version "$(cat "$panel_tag_file")")"
+        fi
+    fi
+
+    local editor_release="$CACHE_ROOT/editor-release.json"
+    if github_release "$EDITOR_REPO" "$editor_release" 2>/dev/null; then
+        EDITOR_LATEST_VERSION="$(normalize_version "$(release_field "$editor_release" tag_name)")"
+    fi
+    if [[ -z "$EDITOR_LATEST_VERSION" ]]; then
+        local editor_tag_file="$CACHE_ROOT/editor-latest-tag.txt"
+        if github_latest_tag "$EDITOR_REPO" "$editor_tag_file" 2>/dev/null; then
+            EDITOR_LATEST_VERSION="$(normalize_version "$(cat "$editor_tag_file")")"
+        fi
+    fi
+
+    if [[ -n "$PANEL_CONTAINER" && -n "$PANEL_LATEST_VERSION" && "$PANEL_VERSION" != "неизвестна" ]] \
+        && version_gt "$PANEL_LATEST_VERSION" "$PANEL_VERSION"; then
+        PANEL_UPDATE_AVAILABLE=1
+        log "Проверяю изменяемые блоки Remnawave $PANEL_LATEST_VERSION…"
+        if check_patch_compatibility_panel "$PANEL_LATEST_VERSION"; then
+            PANEL_LATEST_COMPATIBLE=1
+        fi
+    fi
+}
+
+scan_environment() {
+    PANEL_CONTAINER="$(find_container_exact "$PANEL_CONTAINER_DEFAULT" '(^|-)remnawave$')"
+    EDITOR_CONTAINER="$(find_container_exact "$EDITOR_CONTAINER_DEFAULT" 'xray-ui-editor')"
+
+    PANEL_VERSION="не найдена"
+    EDITOR_VERSION="не найден"
+    PANEL_PATCH_VERSION=""
+    EDITOR_PATCH_VERSION=""
+
+    if [[ -n "$PANEL_CONTAINER" ]]; then
+        PANEL_VERSION="$(panel_version "$PANEL_CONTAINER")"
+        PANEL_PATCH_VERSION="$(component_patch_version "$PANEL_CONTAINER")"
+    fi
+
+    if [[ -n "$EDITOR_CONTAINER" ]]; then
+        EDITOR_VERSION="$(editor_version "$EDITOR_CONTAINER")"
+        EDITOR_PATCH_VERSION="$(component_patch_version "$EDITOR_CONTAINER")"
+    fi
+}
+
+patch_status_text() {
+    local parts=()
+
+    if [[ -n "$PANEL_CONTAINER" ]]; then
+        if [[ -n "$PANEL_PATCH_VERSION" ]]; then
+            parts+=("Remnawave: установлен")
+        else
+            parts+=("Remnawave: не установлен")
+        fi
+    fi
+
+    if [[ -n "$EDITOR_CONTAINER" ]]; then
+        if [[ -n "$EDITOR_PATCH_VERSION" ]]; then
+            parts+=("Editor: установлен")
+        else
+            parts+=("Editor: не установлен")
+        fi
+    fi
+
+    if ((${#parts[@]} == 0)); then
+        printf 'компоненты не найдены'
+        return
+    fi
+
+    local joined=""
+    local part
+    for part in "${parts[@]}"; do
+        [[ -n "$joined" ]] && joined+="; "
+        joined+="$part"
+    done
+    printf '%s' "$joined"
+}
+
+installed_patch_text() {
+    local parts=()
+
+    [[ -n "$PANEL_PATCH_VERSION" ]] && parts+=("Remnawave $PANEL_PATCH_VERSION")
+    [[ -n "$EDITOR_PATCH_VERSION" ]] && parts+=("Editor $EDITOR_PATCH_VERSION")
+
+    if ((${#parts[@]} == 0)); then
+        printf '—'
+        return
+    fi
+
+    local joined=""
+    local part
+    for part in "${parts[@]}"; do
+        [[ -n "$joined" ]] && joined+=", "
+        joined+="$part"
+    done
+    printf '%s' "$joined"
+}
+
+print_header() {
+    clear 2>/dev/null || true
+
+    local width=78
+    local border title_length left right
+    printf -v border '%*s' "$width" ''
+    border="${border// /═}"
+    title_length=${#SCRIPT_NAME}
+    left=$(( (width - title_length) / 2 ))
+    right=$(( width - title_length - left ))
+
+    printf '%b╔%s╗%b\n' "$CYAN$BOLD" "$border" "$RESET"
+    printf '%b║%*s%b%s%b%*s║%b\n' \
+        "$CYAN$BOLD" "$left" '' "$WHITE$BOLD" "$SCRIPT_NAME" \
+        "$CYAN$BOLD" "$right" '' "$RESET"
+    printf '%b╚%s╝%b\n\n' "$CYAN$BOLD" "$border" "$RESET"
+
+    printf '  %-33s %b%s%b' "Версия скрипта:" "$WHITE$BOLD" "$SCRIPT_VERSION" "$RESET"
+    if ((SCRIPT_UPDATE_AVAILABLE)); then
+        printf '  %bДОСТУПНО ОБНОВЛЕНИЕ! [v%s]%b' \
+            "$YELLOW" "$SCRIPT_LATEST_VERSION" "$RESET"
+    fi
+    printf '\n'
+
+    printf '  %-33s %s\n' "Версия Remnawawe:" "$PANEL_VERSION"
+    printf '  %-33s %s\n' "Версия Xray UI Editor:" "$EDITOR_VERSION"
+    printf '  %-33s %s\n' "Статус патча:" "$(patch_status_text)"
+    printf '  %-33s %s\n' "Версия установленного патча:" "$(installed_patch_text)"
+
+    if ((PANEL_UPDATE_AVAILABLE)); then
+        if ((PANEL_LATEST_COMPATIBLE)); then
+            printf '  %bДОСТУПНО ОБНОВЛЕНИЕ С ПАТЧЕМ! [v%s]%b\n' \
+                "$GREEN" "$PANEL_LATEST_VERSION" "$RESET"
+        else
+            printf '  %bДОСТУПНО ОБНОВЛЕНИЕ, ТЕКУЩИЙ ПАТЧ НЕ ПОДДЕРЖИВАЕТСЯ! [v%s]%b\n' \
+                "$RED" "$PANEL_LATEST_VERSION" "$RESET"
+        fi
+    fi
+
+    printf '\n'
+}
+
+menu_item() {
+    local key="$1" text="$2" enabled="$3"
+
+    if [[ "$enabled" == "1" ]]; then
+        printf '  %b%s)%b %s\n' "$CYAN$BOLD" "$key" "$RESET" "$text"
+    else
+        printf '  %b%s) %s [недоступно]%b\n' "$GRAY" "$key" "$text" "$RESET"
+    fi
+}
+
+show_menu() {
+    print_header
+
+    printf '%b  УСТАНОВКА%b\n' "$MAGENTA$BOLD" "$RESET"
+
+    local editor_install_enabled=0
+    local panel_install_enabled=0
+    local both_install_enabled=0
+    local rollback_enabled=0
+
+    [[ -n "$EDITOR_CONTAINER" && -z "$EDITOR_PATCH_VERSION" ]] && editor_install_enabled=1
+    [[ -n "$PANEL_CONTAINER" && -z "$PANEL_PATCH_VERSION" ]] && panel_install_enabled=1
+    [[ -n "$PANEL_CONTAINER" && -n "$EDITOR_CONTAINER" \
+        && -z "$PANEL_PATCH_VERSION" && -z "$EDITOR_PATCH_VERSION" ]] && both_install_enabled=1
+    [[ -n "$PANEL_PATCH_VERSION" || -n "$EDITOR_PATCH_VERSION" ]] && rollback_enabled=1
+
+    menu_item 1 "Пропатчить Xray UI Editor" "$editor_install_enabled"
+    menu_item 2 "Пропатчить Remnawawe" "$panel_install_enabled"
+    menu_item 3 "Пропатчить Remnawawe и Xray UI Editor на одном хосте" "$both_install_enabled"
+
+    printf '\n%b  ОТКАТ%b\n' "$MAGENTA$BOLD" "$RESET"
+    menu_item 4 "Откатить патч" "$rollback_enabled"
+
+    if ((SCRIPT_UPDATE_AVAILABLE || PANEL_UPDATE_AVAILABLE)); then
+        printf '\n%b  ОБНОВЛЕНИЯ%b\n' "$MAGENTA$BOLD" "$RESET"
+        ((SCRIPT_UPDATE_AVAILABLE)) && menu_item 5 "Обновление скрипта" 1
+        ((PANEL_UPDATE_AVAILABLE)) && menu_item 6 "Обновление Remnawawe" 1
+    fi
+
+    printf '\n  %bq)%b Выйти\n\n' "$CYAN$BOLD" "$RESET"
+}
+
+official_panel_image() {
+    local version="$1" current="${2:-}" base
+
+    if [[ "$current" =~ ^(ghcr\.io/)?remnawave/backend: ]]; then
+        base="${current%:*}"
+    elif load_state remnawave 2>/dev/null \
+        && [[ "${ORIGINAL_IMAGE:-}" =~ ^(ghcr\.io/)?remnawave/backend: ]]; then
+        base="${ORIGINAL_IMAGE%:*}"
+    else
+        base="remnawave/backend"
+    fi
+
+    printf '%s:%s\n' "$base" "$version"
+}
+
+
+build_editor_image() {
+    local version="$1" source="$2" image="$3"
+
+    log "Накладываю патч Xray UI Editor…"
+    patch_editor_source "$source"
+
+    log "Собираю patched Editor image: $image"
+    docker build --pull \
+        --label "$LABEL_NS.patch-version=$SCRIPT_VERSION" \
+        --label "$LABEL_NS.component=editor" \
+        --label "$LABEL_NS.upstream-version=$version" \
+        -t "$image" "$source"
+}
+
+build_panel_image() {
+    local version="$1" source_root="$2" image="$3"
+
+    log "Накладываю патч Remnawave…"
+    patch_panel_source "$source_root/frontend" "$source_root/backend"
+
+    log "Собираю frontend Remnawave…"
+    docker run --rm \
+        -v "$source_root/frontend:/work" \
+        -w /work \
+        node:24.18-trixie-slim \
+        bash -lc 'npm ci --no-audit --no-fund && npm run start:build'
+
+    [[ -f "$source_root/frontend/dist/index.html" ]] \
+        || die "Frontend не создал dist/index.html."
+
+    rm -rf "$source_root/backend/patched-frontend-dist"
+    cp -a "$source_root/frontend/dist" "$source_root/backend/patched-frontend-dist"
+
+    log "Собираю patched Remnawave image: $image"
+    docker build --pull \
+        -f "$source_root/backend/Dockerfile.editor-iframe" \
+        --build-arg BRANCH=main \
+        --build-arg __RW_METADATA_VERSION="$version" \
+        --build-arg __RW_METADATA_GIT_BRANCH=main \
+        --build-arg __RW_METADATA_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --label "$LABEL_NS.patch-version=$SCRIPT_VERSION" \
+        --label "$LABEL_NS.component=remnawave" \
+        --label "$LABEL_NS.upstream-version=$version" \
+        -t "$image" \
+        "$source_root/backend"
+}
+
+validate_url_origin() {
+    local value="$1"
+    python3 - "$value" <<'PY'
+import sys
+import urllib.parse
+
+parsed = urllib.parse.urlparse(sys.argv[1])
+if (
+    parsed.scheme != "https"
+    or not parsed.netloc
+    or parsed.path not in ("", "/")
+    or parsed.query
+    or parsed.fragment
+):
+    raise SystemExit(1)
+
+print(f"{parsed.scheme}://{parsed.netloc}")
+PY
+}
+
+validate_editor_sso() {
+    local url="$1" password="$2" response code
+    response="$(mktemp)"
+
+    code="$({
+        SSO_PASSWORD="$password" python3 <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "password": os.environ["SSO_PASSWORD"],
+    "next": "/profiles/00000000-0000-0000-0000-000000000000",
+}))
+PY
+    } | curl -sS \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -o "$response" \
+        -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        --data-binary @- \
+        "$url/api/auth/sso/token" || true)"
+
+    if [[ "$code" != "200" ]] || ! grep -q '"token"' "$response"; then
+        cat "$response" >&2 || true
+        rm -f "$response"
+        return 1
+    fi
+
+    rm -f "$response"
+}
+
+
+editor_local_url() {
+    local container="$1" mapping port
+    mapping="$(docker port "$container" 3000/tcp 2>/dev/null | head -n1 || true)"
+    [[ -n "$mapping" ]] || return 1
+    port="${mapping##*:}"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    printf 'http://127.0.0.1:%s\n' "$port"
+}
+
+validate_editor_login() {
+    local url="$1" password="$2" response code
+    response="$(mktemp)"
+    code="$({
+        LOGIN_PASSWORD="$password" python3 <<'PY'
+import json
+import os
+print(json.dumps({"password": os.environ["LOGIN_PASSWORD"]}))
+PY
+    } | curl -sS \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -o "$response" \
+        -w '%{http_code}' \
+        -H 'Content-Type: application/json' \
+        --data-binary @- \
+        "$url/api/auth/login" || true)"
+
+    if [[ "$code" != "200" ]]; then
+        cat "$response" >&2 || true
+        rm -f "$response"
+        return 1
+    fi
+    rm -f "$response"
+}
+
+check_frame_headers() {
+    local child_url="$1" parent_origin="$2" headers
+    headers="$(curl -skD- -o /dev/null \
+        --connect-timeout 10 --max-time 30 "$child_url/" || true)"
+
+    if printf '%s\n' "$headers" \
+        | grep -i '^x-frame-options:' \
+        | grep -Eqi '(deny|sameorigin)'; then
+        warn "Reverse proxy $child_url отдаёт X-Frame-Options, который может блокировать iframe."
+        return 1
+    fi
+
+    if ! printf '%s\n' "$headers" \
+        | grep -i '^content-security-policy:' \
+        | grep -Fq "$parent_origin"; then
+        warn "CSP $child_url не разрешает frame-ancestors $parent_origin. Возможно, reverse proxy заменяет заголовок приложения."
+        return 1
+    fi
+
+    return 0
+}
+
+install_editor_patch() {
+    local panel_origin="${1:-}"
+    local password="${2:-}"
+    local version dir compose service env_file current backup image source local_url
+
+    [[ -n "$EDITOR_CONTAINER" ]] || die "Xray UI Editor не найден."
+    [[ -z "$EDITOR_PATCH_VERSION" ]] || die "Xray UI Editor уже пропатчен."
+
+    version="$EDITOR_VERSION"
+    if [[ "$version" == "неизвестна" || "$version" == "не найден" ]]; then
+        version="${EDITOR_LATEST_VERSION:-1.2.0}"
+        version="$(prompt_value "Версия Xray UI Editor для сборки" "$version")"
+    fi
+
+    log "Проверяю совместимость Editor $version…"
+    check_patch_compatibility_editor "$version" \
+        || die "Xray UI Editor $version несовместим с патчем $SCRIPT_VERSION."
+
+    if [[ -z "$panel_origin" ]]; then
+        panel_origin="$(prompt_value \
+            "HTTPS origin панели Remnawave" \
+            "https://panel.example.com")"
+    fi
+    panel_origin="$(validate_url_origin "$panel_origin")" \
+        || die "Нужен origin вида https://panel.example.com без пути."
+
+    if [[ -z "$password" ]]; then
+        password="$(prompt_secret "APP_PASSWORD Xray UI Editor")"
+    fi
+    [[ -n "$password" ]] || die "Пароль пуст."
+
+    local_url="$(editor_local_url "$EDITOR_CONTAINER" || true)"
+    if [[ -n "$local_url" ]]; then
+        validate_editor_login "$local_url" "$password" \
+            || die "APP_PASSWORD не принят текущим Xray UI Editor."
+    else
+        warn "Публичный host-port Editor не найден; пароль будет проверен после установки с сервера Remnawave."
+    fi
+
+    dir="$(find_working_dir "$EDITOR_CONTAINER" "$EDITOR_DIR_DEFAULT")"
+    compose="$(find_compose_file "$EDITOR_CONTAINER" "$dir")" \
+        || die "Compose Xray UI Editor не найден."
+    service="$(find_service_name "$EDITOR_CONTAINER" remnawave-xray-ui-editor)"
+    env_file="$dir/.env"
+    [[ -f "$env_file" ]] || die "Не найден $env_file"
+
+    current="$(docker inspect "$EDITOR_CONTAINER" --format '{{.Config.Image}}')"
+    backup="$(backup_current_image editor "$EDITOR_CONTAINER")"
+    image="local/capyteam/rw-wasm-editor:${version}-patch-${SCRIPT_VERSION}"
+    source="$BUILD_ROOT/editor-$version"
+
+    download_editor_source "$version" "$source"
+    build_editor_image "$version" "$source" "$image"
+
+    save_state editor \
+        PATCHED 1 \
+        PATCH_VERSION "$SCRIPT_VERSION" \
+        UPSTREAM_VERSION "$version" \
+        ORIGINAL_IMAGE "$current" \
+        BACKUP_IMAGE "$backup" \
+        PATCH_IMAGE "$image" \
+        COMPOSE_FILE "$compose" \
+        WORKING_DIR "$dir" \
+        SERVICE "$service" \
+        PANEL_ORIGIN "$panel_origin"
+
+    write_dotenv "$env_file" XRAY_EDITOR_FRAME_ANCESTOR "$panel_origin"
+    replace_service_image "$compose" "$service" "$image"
+
+    (
+        cd "$dir"
+        docker compose config >/dev/null
+        docker compose up -d --force-recreate "$service"
+    )
+
+    wait_healthy "$EDITOR_CONTAINER" 240
+
+    local_url="$(editor_local_url "$EDITOR_CONTAINER" || true)"
+    if [[ -n "$local_url" ]]; then
+        validate_editor_sso "$local_url" "$password" \
+            || die "Patched Editor запущен, но локальная SSO-проверка не прошла. Используйте меню отката."
+    fi
+
+    save_state editor \
+        PATCHED 1 \
+        PATCH_VERSION "$SCRIPT_VERSION" \
+        UPSTREAM_VERSION "$version" \
+        ORIGINAL_IMAGE "$current" \
+        BACKUP_IMAGE "$backup" \
+        PATCH_IMAGE "$image" \
+        COMPOSE_FILE "$compose" \
+        WORKING_DIR "$dir" \
+        SERVICE "$service" \
+        PANEL_ORIGIN "$panel_origin"
+
+    ok "Xray UI Editor пропатчен."
+}
+
+install_panel_patch() {
+    local editor_url="${1:-}"
+    local password="${2:-}"
+    local panel_url="${3:-}"
+    local version dir compose service env_file current backup image source
+
+    [[ -n "$PANEL_CONTAINER" ]] || die "Remnawave не найдена."
+    [[ -z "$PANEL_PATCH_VERSION" ]] || die "Remnawave уже пропатчена."
+
+    version="$PANEL_VERSION"
+    [[ "$version" != "неизвестна" && "$version" != "не найдена" ]] \
+        || die "Не удалось определить версию Remnawave."
+
+    log "Проверяю совместимость Remnawave $version…"
+    check_patch_compatibility_panel "$version" \
+        || die "Remnawave $version несовместима с патчем $SCRIPT_VERSION."
+
+    if [[ -z "$editor_url" ]]; then
+        editor_url="$(prompt_value \
+            "HTTPS URL Xray UI Editor" \
+            "https://editor.example.com")"
+    fi
+    editor_url="$(validate_url_origin "$editor_url")" \
+        || die "Нужен URL вида https://editor.example.com без пути."
+
+    if [[ -z "$password" ]]; then
+        password="$(prompt_secret "APP_PASSWORD удалённого Xray UI Editor")"
+    fi
+    [[ -n "$password" ]] || die "Пароль пуст."
+
+    if [[ -z "$panel_url" ]]; then
+        panel_url="$(prompt_value \
+            "Публичный HTTPS URL панели для проверки" \
+            "https://panel.example.com")"
+    fi
+    panel_url="$(validate_url_origin "$panel_url")" \
+        || die "Нужен URL вида https://panel.example.com без пути."
+
+    validate_editor_sso "$editor_url" "$password" \
+        || die "Editor не принял SSO-запрос. Сначала пропатчите Xray UI Editor."
+
+    dir="$(find_working_dir "$PANEL_CONTAINER" "$PANEL_DIR_DEFAULT")"
+    compose="$(find_compose_file "$PANEL_CONTAINER" "$dir")" \
+        || die "Compose Remnawave не найден."
+    service="$(find_service_name "$PANEL_CONTAINER" remnawave)"
+    env_file="$dir/.env"
+    [[ -f "$env_file" ]] || die "Не найден $env_file"
+
+    current="$(docker inspect "$PANEL_CONTAINER" --format '{{.Config.Image}}')"
+    backup="$(backup_current_image remnawave "$PANEL_CONTAINER")"
+    image="local/capyteam/rw-wasm-remnawave:${version}-patch-${SCRIPT_VERSION}"
+    source="$BUILD_ROOT/remnawave-$version"
+
+    download_panel_sources "$version" "$source"
+    build_panel_image "$version" "$source" "$image"
+
+    save_state remnawave \
+        PATCHED 1 \
+        PATCH_VERSION "$SCRIPT_VERSION" \
+        UPSTREAM_VERSION "$version" \
+        ORIGINAL_IMAGE "$current" \
+        BACKUP_IMAGE "$backup" \
+        PATCH_IMAGE "$image" \
+        COMPOSE_FILE "$compose" \
+        WORKING_DIR "$dir" \
+        SERVICE "$service" \
+        PANEL_URL "$panel_url" \
+        EDITOR_URL "$editor_url"
+
+    write_dotenv "$env_file" XRAY_EDITOR_URL "$editor_url"
+    write_dotenv "$env_file" XRAY_EDITOR_PASSWORD "$password"
+    replace_service_image "$compose" "$service" "$image"
+
+    (
+        cd "$dir"
+        docker compose config >/dev/null
+        docker compose up -d --force-recreate "$service"
+    )
+
+    wait_healthy "$PANEL_CONTAINER" 360
+    restart_reverse_proxy
+
+    if ! curl -kfsS \
+        --connect-timeout 10 \
+        --max-time 30 \
+        "$panel_url/" >/dev/null; then
+        warn "Контейнер healthy, но публичная проверка панели не прошла. Проверьте reverse proxy."
+    fi
+
+    check_frame_headers "$editor_url" "$panel_url" || true
+
+    local panel_headers
+    panel_headers="$(curl -skD- -o /dev/null \
+        --connect-timeout 10 --max-time 30 "$panel_url/" || true)"
+    if ! printf '%s\n' "$panel_headers" \
+        | grep -i '^content-security-policy:' \
+        | grep -Fq "$editor_url"; then
+        warn "Публичный CSP панели не содержит frame-src $editor_url. Reverse proxy может заменять CSP приложения."
+    fi
+
+    save_state remnawave \
+        PATCHED 1 \
+        PATCH_VERSION "$SCRIPT_VERSION" \
+        UPSTREAM_VERSION "$version" \
+        ORIGINAL_IMAGE "$current" \
+        BACKUP_IMAGE "$backup" \
+        PATCH_IMAGE "$image" \
+        COMPOSE_FILE "$compose" \
+        WORKING_DIR "$dir" \
+        SERVICE "$service" \
+        PANEL_URL "$panel_url" \
+        EDITOR_URL "$editor_url"
+
+    ok "Remnawave пропатчена."
+}
+
+install_both_patch() {
+    local panel_origin editor_url password
+
+    panel_origin="$(prompt_value \
+        "HTTPS origin панели Remnawave" \
+        "https://panel.example.com")"
+    panel_origin="$(validate_url_origin "$panel_origin")" \
+        || die "Некорректный origin панели."
+
+    editor_url="$(prompt_value \
+        "HTTPS URL Xray UI Editor" \
+        "https://editor.example.com")"
+    editor_url="$(validate_url_origin "$editor_url")" \
+        || die "Некорректный URL Editor."
+
+    password="$(prompt_secret "APP_PASSWORD Xray UI Editor")"
+    [[ -n "$password" ]] || die "Пароль пуст."
+
+    install_editor_patch "$panel_origin" "$password"
+    scan_environment
+    install_panel_patch "$editor_url" "$password" "$panel_origin"
+}
+
+
+rollback_component() {
+    local component="$1" mode="$2"
+    local container version target compose dir service
+
+    if [[ "$component" == "remnawave" ]]; then
+        container="$PANEL_CONTAINER"
+        version="$PANEL_VERSION"
+    else
+        container="$EDITOR_CONTAINER"
+        version="$EDITOR_VERSION"
+    fi
+
+    [[ -n "$container" ]] || die "Компонент $component не найден."
+
+    if ! load_state "$component"; then
+        if [[ "$mode" == "full" && "$component" == "remnawave" ]]; then
+            compose="$(find_compose_file "$container" "$PANEL_DIR_DEFAULT")" \
+                || die "Compose Remnawave не найден."
+            dir="$(find_working_dir "$container" "$PANEL_DIR_DEFAULT")"
+            service="$(find_service_name "$container" remnawave)"
+            target="$(official_panel_image "$version" \
+                "$(docker inspect "$container" --format '{{.Config.Image}}')")"
+            docker pull "$target"
+        elif [[ "$mode" == "full" && "$component" == "editor" ]]; then
+            compose="$(find_compose_file "$container" "$EDITOR_DIR_DEFAULT")" \
+                || die "Compose Xray UI Editor не найден."
+            dir="$(find_working_dir "$container" "$EDITOR_DIR_DEFAULT")"
+            service="$(find_service_name "$container" remnawave-xray-ui-editor)"
+            [[ "$version" != "неизвестна" && "$version" != "не найден" ]] \
+                || die "Не удалось определить версию Editor для полного отката."
+            local clean_source="$BUILD_ROOT/editor-clean-$version"
+            target="local/capyteam/rw-wasm-editor-clean:${version}"
+            download_editor_source "$version" "$clean_source"
+            docker build --pull \
+                --label "$LABEL_NS.component=editor-clean" \
+                --label "$LABEL_NS.upstream-version=$version" \
+                -t "$target" "$clean_source"
+        else
+            die "Нет state-файла с точным backup image для отката $component до бэкапа."
+        fi
+    else
+        compose="$COMPOSE_FILE"
+        dir="$WORKING_DIR"
+        service="$SERVICE"
+
+        if [[ "$mode" == "full" ]]; then
+            if [[ "$component" == "remnawave" ]]; then
+                target="$(official_panel_image "$version" "$ORIGINAL_IMAGE")"
+                docker pull "$target"
+            else
+                target="$ORIGINAL_IMAGE"
+                docker image inspect "$target" >/dev/null 2>&1 || docker pull "$target"
+            fi
+        else
+            target="$BACKUP_IMAGE"
+            docker image inspect "$target" >/dev/null 2>&1 \
+                || die "Backup image $target отсутствует."
+        fi
+    fi
+
+    replace_service_image "$compose" "$service" "$target"
+
+    (
+        cd "$dir"
+        docker compose config >/dev/null
+        docker compose up -d --force-recreate "$service"
+    )
+
+    wait_healthy "$container" 360
+
+    if [[ "$component" == "remnawave" ]]; then
+        restart_reverse_proxy
+    fi
+
+    archive_state "$component"
+    ok "$component возвращён на image $target. БД, volumes и остальные настройки сохранены."
+}
+
+rollback_menu() {
+    local components=()
+    local selected=()
+    local component_choice mode_choice component
+
+    [[ -n "$PANEL_PATCH_VERSION" ]] && components+=("remnawave")
+    [[ -n "$EDITOR_PATCH_VERSION" ]] && components+=("editor")
+
+    if ((${#components[@]} == 0)); then
+        warn "Установленный патч не найден."
+        return
+    fi
+
+    if ((${#components[@]} == 2)); then
+        printf '\n1) Remnawave\n'
+        printf '2) Xray UI Editor\n'
+        printf '3) Оба компонента\n'
+        printf 'q) Отмена\n'
+        read -r -p '> ' component_choice
+
+        case "$component_choice" in
+            1) selected=("remnawave") ;;
+            2) selected=("editor") ;;
+            3) selected=("editor" "remnawave") ;;
+            *) return ;;
+        esac
+    else
+        selected=("${components[0]}")
+    fi
+
+    printf '\n1) Полный откат — официальный/исходный image текущей версии\n'
+    printf '2) Откат до бэкапа — точный image до установки патча\n'
+    printf 'q) Отмена\n'
+    read -r -p '> ' mode_choice
+
+    case "$mode_choice" in
+        1) mode_choice="full" ;;
+        2) mode_choice="backup" ;;
+        *) return ;;
+    esac
+
+    warn "Будут пересозданы только выбранные контейнеры. БД, Docker volumes, Compose и остальные сервисы не удаляются."
+    confirm_yn "Продолжить откат?" || return
+
+    for component in "${selected[@]}"; do
+        rollback_component "$component" "$mode_choice"
+        scan_environment
+    done
+}
+
+update_script() {
+    local body asset checksum_asset sums tmp self new_version tag_name expected actual
+
+    body="$(release_field "$SCRIPT_RELEASE_FILE" body)"
+    tag_name="$(release_field "$SCRIPT_RELEASE_FILE" tag_name)"
+
+    printf '\n%bИзменения в %s:%b\n%s\n\n' \
+        "$BOLD" "$tag_name" "$RESET" \
+        "${body:-Описание релиза отсутствует.}"
+
+    confirm_yn "Установить обновление скрипта?" || return
+
+    asset="$(release_asset_url "$SCRIPT_RELEASE_FILE" rw-wasm)"
+    if [[ -z "$asset" ]]; then
+        asset="https://raw.githubusercontent.com/$SCRIPT_REPO/$tag_name/rw-wasm"
+    fi
+
+    tmp="$(mktemp)"
+    curl -fsSL \
+        --connect-timeout 10 \
+        --max-time 120 \
+        --retry 3 \
+        "$asset" \
+        -o "$tmp"
+
+    checksum_asset="$(release_asset_url "$SCRIPT_RELEASE_FILE" SHA256SUMS)"
+    if [[ -n "$checksum_asset" ]]; then
+        sums="$(mktemp)"
+        curl -fsSL \
+            --connect-timeout 10 \
+            --max-time 120 \
+            --retry 3 \
+            "$checksum_asset" \
+            -o "$sums"
+        expected="$(awk '$2 == "rw-wasm" || $2 == "*rw-wasm" {print $1; exit}' "$sums")"
+        actual="$(sha256sum "$tmp" | awk '{print $1}')"
+        rm -f "$sums"
+        [[ -n "$expected" && "$actual" == "$expected" ]] \
+            || die "SHA-256 загруженного rw-wasm не совпадает с SHA256SUMS релиза."
+        ok "Контрольная сумма обновления подтверждена."
+    else
+        warn "В релизе нет SHA256SUMS; проверяется HTTPS GitHub и синтаксис Bash."
+    fi
+
+    chmod 755 "$tmp"
+    bash -n "$tmp"
+
+    new_version="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | cut -d'"' -f2)"
+    [[ "$new_version" == "$SCRIPT_LATEST_VERSION" ]] \
+        || die "Версия загруженного файла ($new_version) не совпадает с релизом ($SCRIPT_LATEST_VERSION)."
+
+    self="$(readlink -f "$0")"
+    install -m 0755 "$tmp" "${self}.new"
+    mv -f "${self}.new" "$self"
+    rm -f "$tmp"
+
+    ok "Скрипт обновлён до $new_version."
+    exec "$self"
+}
+
+clean_update_panel() {
+    local version="$1"
+    local dir compose service current target
+
+    dir="$(find_working_dir "$PANEL_CONTAINER" "$PANEL_DIR_DEFAULT")"
+    compose="$(find_compose_file "$PANEL_CONTAINER" "$dir")" \
+        || die "Compose Remnawave не найден."
+    service="$(find_service_name "$PANEL_CONTAINER" remnawave)"
+    current="$(docker inspect "$PANEL_CONTAINER" --format '{{.Config.Image}}')"
+    target="$(official_panel_image "$version" "$current")"
+
+    log "Загружаю официальный image $target…"
+    docker pull "$target"
+
+    replace_service_image "$compose" "$service" "$target"
+
+    (
+        cd "$dir"
+        docker compose config >/dev/null
+        docker compose up -d --force-recreate "$service"
+    )
+
+    wait_healthy "$PANEL_CONTAINER" 480
+    restart_reverse_proxy
+    archive_state remnawave
+
+    ok "Установлена чистая официальная Remnawave $version. БД и volumes сохранены."
+}
+
+patched_update_panel() {
+    local version="$1"
+    local dir env_file editor_url password panel_url
+
+    dir="$(find_working_dir "$PANEL_CONTAINER" "$PANEL_DIR_DEFAULT")"
+    env_file="$dir/.env"
+
+    editor_url="$(read_dotenv "$env_file" XRAY_EDITOR_URL)"
+    password="$(read_dotenv "$env_file" XRAY_EDITOR_PASSWORD)"
+    panel_url=""
+
+    if load_state remnawave 2>/dev/null; then
+        panel_url="${PANEL_URL:-}"
+    fi
+
+    [[ -n "$editor_url" ]] \
+        || editor_url="$(prompt_value "HTTPS URL Xray UI Editor" "https://editor.example.com")"
+    [[ -n "$password" ]] \
+        || password="$(prompt_secret "APP_PASSWORD Xray UI Editor")"
+    [[ -n "$panel_url" ]] \
+        || panel_url="$(prompt_value "Публичный HTTPS URL панели" "https://panel.example.com")"
+
+    PANEL_PATCH_VERSION=""
+    PANEL_VERSION="$version"
+
+    install_panel_patch "$editor_url" "$password" "$panel_url"
+}
+
+update_panel_menu() {
+    local choice
+
+    if ((PANEL_LATEST_COMPATIBLE)); then
+        printf '\n%bRemnawave %s поддерживается патчем %s.%b\n' \
+            "$GREEN" "$PANEL_LATEST_VERSION" "$SCRIPT_VERSION" "$RESET"
+        printf '1) Установить обновление с патчем\n'
+        printf '2) Установить чистую официальную версию\n'
+        printf 'q) Отмена\n'
+        read -r -p '> ' choice
+
+        case "$choice" in
+            1)
+                confirm_yn "Установить обновление с патчем?" \
+                    && patched_update_panel "$PANEL_LATEST_VERSION"
+                ;;
+            2)
+                confirm_yn "Установить чистую официальную версию?" \
+                    && clean_update_panel "$PANEL_LATEST_VERSION"
+                ;;
+        esac
+    else
+        printf '\n%bВНИМАНИЕ: патч %s не совместим с Remnawave %s.%b\n' \
+            "$RED" "$SCRIPT_VERSION" "$PANEL_LATEST_VERSION" "$RESET"
+        printf 'Будет установлен чистый официальный image без изменений исходного кода.\n'
+
+        confirm_yn "Продолжить обновление без патча?" \
+            && clean_update_panel "$PANEL_LATEST_VERSION"
+    fi
+}
+
+install_cli() {
+    require_root
+
+    local self target="${RW_WASM_INSTALL_PATH:-/usr/local/bin/rw-wasm}"
+    self="$(readlink -f "$0")"
+
+    if [[ "$self" != "$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")" ]]; then
+        install -m 0755 "$self" "$target"
+    else
+        chmod 0755 "$target"
+    fi
+    ok "Команда установлена: $target"
+    printf 'Теперь меню открывается командой: rw-wasm\n'
+}
+
+main_menu() {
+    local choice
+
+    while true; do
+        scan_environment
+        show_menu
+        read -r -p '> ' choice
+
+        case "${choice,,}" in
+            1)
+                if [[ -n "$EDITOR_CONTAINER" && -z "$EDITOR_PATCH_VERSION" ]]; then
+                    install_editor_patch
+                else
+                    warn "Пункт недоступен."
+                fi
+                pause
+                ;;
+            2)
+                if [[ -n "$PANEL_CONTAINER" && -z "$PANEL_PATCH_VERSION" ]]; then
+                    install_panel_patch
+                else
+                    warn "Пункт недоступен."
+                fi
+                pause
+                ;;
+            3)
+                if [[ -n "$PANEL_CONTAINER" && -n "$EDITOR_CONTAINER" \
+                    && -z "$PANEL_PATCH_VERSION" && -z "$EDITOR_PATCH_VERSION" ]]; then
+                    install_both_patch
+                else
+                    warn "Пункт недоступен."
+                fi
+                pause
+                ;;
+            4)
+                if [[ -n "$PANEL_PATCH_VERSION" || -n "$EDITOR_PATCH_VERSION" ]]; then
+                    rollback_menu
+                else
+                    warn "Пункт недоступен."
+                fi
+                pause
+                ;;
+            5)
+                if ((SCRIPT_UPDATE_AVAILABLE)); then
+                    update_script
+                else
+                    warn "Обновление скрипта недоступно."
+                    pause
+                fi
+                ;;
+            6)
+                if ((PANEL_UPDATE_AVAILABLE)); then
+                    update_panel_menu
+                    scan_environment
+                    check_updates
+                else
+                    warn "Обновление Remnawave недоступно."
+                fi
+                pause
+                ;;
+            q)
+                printf '%bДо встречи!%b\n' "$CYAN" "$RESET"
+                exit 0
+                ;;
+            *)
+                warn "Неизвестный пункт меню."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+case "${1:-}" in
+    --version|-v)
+        printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+        exit 0
+        ;;
+    --install)
+        require_root
+        init_runtime
+        install_cli
+        exit 0
+        ;;
+    --offline)
+        export RW_WASM_OFFLINE=1
+        ;;
+    --help|-h)
+        cat <<EOF
+$SCRIPT_NAME v$SCRIPT_VERSION
+
+Использование:
+  rw-wasm             открыть интерактивное меню
+  rw-wasm --offline   открыть меню без проверки GitHub
+  rw-wasm --install   установить команду /usr/local/bin/rw-wasm
+  rw-wasm --version   показать версию
+EOF
+        exit 0
+        ;;
+esac
+
+require_root
+init_runtime
+require_tools
+scan_environment
+log "Проверяю обновления и совместимость исходников…"
+check_updates || warn "Проверка обновлений завершилась с ошибкой; локальные функции доступны."
+main_menu
