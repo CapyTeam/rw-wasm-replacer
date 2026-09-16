@@ -1,0 +1,154 @@
+name: Temporary rw-wasm hotfix
+
+on:
+  push:
+    branches:
+      - fix/remnawave-3.4.3-settings
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remnawave-3.4.3-settings
+
+      - name: Patch rw-wasm
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('rw-wasm')
+          text = path.read_text(encoding='utf-8')
+
+          old_version = 'SCRIPT_VERSION="1.0.0"'
+          if old_version not in text:
+              raise SystemExit('Expected SCRIPT_VERSION 1.0.0 not found')
+          text = text.replace(old_version, 'SCRIPT_VERSION="1.0.1"', 1)
+
+          old_panel_local = '''check_patch_compatibility_panel() {
+              local version="$1" root="$CACHE_ROOT/compat-panel-$version"
+          '''
+          new_panel_local = '''check_patch_compatibility_panel() {
+              local version="$1"
+              local root="$CACHE_ROOT/compat-panel-$version"
+          '''
+          if old_panel_local not in text:
+              raise SystemExit('Panel compatibility local declaration anchor not found')
+          text = text.replace(old_panel_local, new_panel_local, 1)
+
+          old_editor_local = '''check_patch_compatibility_editor() {
+              local version="$1" root="$CACHE_ROOT/compat-editor-$version"
+          '''
+          new_editor_local = '''check_patch_compatibility_editor() {
+              local version="$1"
+              local root="$CACHE_ROOT/compat-editor-$version"
+          '''
+          if old_editor_local not in text:
+              raise SystemExit('Editor compatibility local declaration anchor not found')
+          text = text.replace(old_editor_local, new_editor_local, 1)
+
+          start_marker = 'visual_path = frontend / "src/widgets/remnawave-settings/visual-settings-card/visual-settings-card.widget.tsx"\n'
+          end_marker = 'visual_path.write_text(visual, encoding="utf-8")\n'
+          start = text.find(start_marker)
+          if start < 0:
+              raise SystemExit('Visual settings patch start not found')
+          end = text.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('Visual settings patch end not found')
+          end += len(end_marker)
+
+          new_ui_block = r'''experimental_path = frontend / "src/widgets/remnawave-settings/experimental-settings-card/experimental-settings-card.widget.tsx"
+          experimental = require(
+              experimental_path,
+              "import { TbFlask, TbLayoutSidebar, TbPlugConnected, TbRocket, TbTerminal2 } from 'react-icons/tb'",
+          )
+          experimental = experimental.replace(
+              "import { TbFlask, TbLayoutSidebar, TbPlugConnected, TbRocket, TbTerminal2 } from 'react-icons/tb'",
+              "import { TbCode, TbFlask, TbLayoutSidebar, TbPlugConnected, TbRocket, TbTerminal2 } from 'react-icons/tb'",
+              1,
+          )
+          if "useExternalProfileEditorPreference" not in experimental:
+              import_anchor = "import { useIsMobile } from '@shared/hooks'"
+              if import_anchor not in experimental:
+                  raise SystemExit("Не найден import useIsMobile в Experimental settings")
+              experimental = experimental.replace(
+                  import_anchor,
+                  "import { useExternalProfileEditorPreference } from "
+                  "'@shared/external-profile-editor/preference'\n"
+                  "import { useIsMobile } from '@shared/hooks'",
+                  1,
+              )
+          if "externalEditorEnabled" not in experimental:
+              hook_anchor = "    const isMobile = useIsMobile()\n"
+              if hook_anchor not in experimental:
+                  raise SystemExit("Не найден useIsMobile hook в Experimental settings")
+              experimental = experimental.replace(
+                  hook_anchor,
+                  '''    const isMobile = useIsMobile()
+              const { enabled: externalEditorEnabled, setEnabled: setExternalEditorEnabled } =
+                  useExternalProfileEditorPreference()
+          ''',
+                  1,
+              )
+
+          editor_card = '''                    {!isMobile && (
+                              <Checkbox.Card
+                                  checked={externalEditorEnabled}
+                                  className={classes.feature}
+                                  onClick={() => setExternalEditorEnabled(!externalEditorEnabled)}
+                                  radius="md"
+                              >
+                                  <Group align="center" gap="sm" wrap="nowrap">
+                                      <ThemeIcon color="violet" radius="md" size="lg" variant="soft">
+                                          <TbCode size={20} />
+                                      </ThemeIcon>
+
+                                      <Text className={classes.label} flex={1} size="sm" truncate>
+                                          Xray UI Editor вместо WASM
+                                      </Text>
+
+                                      <Checkbox.Indicator size="sm" />
+                                  </Group>
+                              </Checkbox.Card>
+                          )}'''
+          if editor_card not in experimental:
+              card_anchor = '''                        ))}
+                      </Stack>'''
+              if card_anchor not in experimental:
+                  raise SystemExit("Не найден конец списка Experimental settings")
+              experimental = experimental.replace(
+                  card_anchor,
+                  "                        ))}\n" + editor_card + "\n                </Stack>",
+                  1,
+              )
+          experimental_path.write_text(experimental, encoding="utf-8")
+          '''
+
+          text = text[:start] + new_ui_block + text[end:]
+          path.write_text(text, encoding='utf-8')
+
+          changelog = Path('CHANGELOG.md')
+          current = changelog.read_text(encoding='utf-8')
+          entry = '''## 1.0.1 (Remnawawe 3.4.3–3.4.4)\n\n- Исправлена ошибка `version: unbound variable` при проверке совместимости с новой версией Remnawave.\n- Переключатель Xray UI Editor перенесён из Visual settings в «Экспериментальные возможности».\n- Патч настроек адаптирован к интерфейсу Remnawave 3.4.3 и 3.4.4.\n\n'''
+          if '## 1.0.1 ' not in current:
+              current = current.replace('# Changelog\n\n', '# Changelog\n\n' + entry, 1)
+              changelog.write_text(current, encoding='utf-8')
+          PY
+
+          bash -n rw-wasm
+
+      - name: Commit hotfix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rw-wasm CHANGELOG.md
+          git diff --cached --check
+          git commit -m "fix: support Remnawave 3.4.x settings"
+          git push origin HEAD:fix/remnawave-3.4.3-settings
