@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_NAME="Remnawawe WASM Replacer by CapyTeam"
 SCRIPT_REPO="CapyTeam/rw-wasm-replacer"
 PANEL_BACKEND_REPO="remnawave/backend"
@@ -756,6 +756,7 @@ patch_panel_source() {
     FRONTEND_SRC="$frontend" BACKEND_SRC="$backend" python3 <<'PY'
 from pathlib import Path
 import os
+import re
 
 frontend = Path(os.environ["FRONTEND_SRC"])
 backend = Path(os.environ["BACKEND_SRC"])
@@ -1151,35 +1152,42 @@ profile = require(
     "import { ConfigEditorWidget } from '@widgets/dashboard/config-profiles/config-editor/config-editor.widget'",
 )
 if "external-profile-editor-frame" not in profile:
+    profile_import_anchor = (
+        "import { ConfigEditorWidget } from "
+        "'@widgets/dashboard/config-profiles/config-editor/config-editor.widget'"
+    )
     profile = profile.replace(
-        "import { ROUTES } from '@shared/constants'",
-        "import { ROUTES } from '@shared/constants'\n"
-        "import { ExternalProfileEditorFrame } from "
-        "'@shared/external-profile-editor/external-profile-editor-frame'",
+        profile_import_anchor,
+        profile_import_anchor
+        + "\nimport { ExternalProfileEditorFrame } from "
+        + "'@shared/external-profile-editor/external-profile-editor-frame'",
         1,
     )
 
-desktop = '''                            <ConfigEditorWidget
-                                configProfile={configProfile}
-                                isWasmCrashed={isWasmCrashed}
-                                isWasmRestarting={isWasmRestarting}
-                                onRestartWasm={onRestartWasm}
-                                snippets={snippets}
-                            />'''
-wrapped = '''                            <ExternalProfileEditorFrame profileUuid={configProfile.uuid}>
-                                <ConfigEditorWidget
-                                    configProfile={configProfile}
-                                    isWasmCrashed={isWasmCrashed}
-                                    isWasmRestarting={isWasmRestarting}
-                                    onRestartWasm={onRestartWasm}
-                                    snippets={snippets}
-                                />
-                            </ExternalProfileEditorFrame>'''
-if wrapped not in profile:
-    position = profile.rfind(desktop)
-    if position < 0:
-        raise SystemExit("Десктопный ConfigEditorWidget не найден")
-    profile = profile[:position] + wrapped + profile[position + len(desktop):]
+widget_pattern = re.compile(
+    r"(?P<indent>^[ \t]*)<ConfigEditorWidget\n"
+    r"(?P=indent)    configProfile=\{configProfile\}\n"
+    r"(?P=indent)    isWasmCrashed=\{isWasmCrashed\}\n"
+    r"(?P=indent)    isWasmRestarting=\{isWasmRestarting\}\n"
+    r"(?P=indent)    onRestartWasm=\{onRestartWasm\}\n"
+    r"(?P=indent)    snippets=\{snippets\}\n"
+    r"(?P=indent)/>",
+    re.MULTILINE,
+)
+widget_matches = list(widget_pattern.finditer(profile))
+if not widget_matches:
+    raise SystemExit("ConfigEditorWidget для встраивания Editor не найден")
+last_widget = widget_matches[-1]
+widget_text = last_widget.group(0)
+indent = last_widget.group("indent")
+if "<ExternalProfileEditorFrame profileUuid={configProfile.uuid}>" not in profile:
+    indented_widget = "\n".join("    " + line for line in widget_text.splitlines())
+    wrapped = (
+        f"{indent}<ExternalProfileEditorFrame profileUuid={{configProfile.uuid}}>\n"
+        f"{indented_widget}\n"
+        f"{indent}</ExternalProfileEditorFrame>"
+    )
+    profile = profile[:last_widget.start()] + wrapped + profile[last_widget.end():]
 profile_path.write_text(profile, encoding="utf-8")
 
 connector_path = frontend / "src/pages/dashboard/config-profiles/connectors/config-profile-by-uuid.page.connector.tsx"
@@ -1194,8 +1202,11 @@ if "isExternalProfileEditorEnabled" not in connector:
     )
 
 if "const useExternalEditor =" not in connector:
+    uuid_anchor = "    const { uuid } = useParams()\n"
+    if uuid_anchor not in connector:
+        raise SystemExit("Не найден useParams anchor в Config Profile connector")
     connector = connector.replace(
-        "    const { uuid } = useParams()\n",
+        uuid_anchor,
         '''    const { uuid } = useParams()
 
     const useExternalEditor =
@@ -1227,12 +1238,10 @@ new_effect = '''    useLayoutEffect(() => {
     }, [initWasm, useExternalEditor])
 '''
 if new_effect not in connector:
+    if old_effect not in connector:
+        raise SystemExit("Не найден useLayoutEffect инициализации WASM")
     connector = connector.replace(old_effect, new_effect, 1)
 
-old_gate = '''    if (isLoading || isConfigProfileLoading || !configProfile || isSnippetsLoading || !snippets) {
-        return <LoadingScreen text="WASM module is loading..." value={downloadProgress} />
-    }
-'''
 new_gate = '''    if (
         (!useExternalEditor && isLoading) ||
         isConfigProfileLoading ||
@@ -1249,34 +1258,99 @@ new_gate = '''    if (
     }
 '''
 if new_gate not in connector:
-    connector = connector.replace(old_gate, new_gate, 1)
+    gate_pattern = re.compile(
+        r'''    if \(isLoading \|\| isConfigProfileLoading \|\| !configProfile \|\| isSnippetsLoading \|\| !snippets\) \{\n'''
+        r'''        return <LoadingScreen text="(?:The )?WASM module is loading\.\.\." value=\{downloadProgress\} />\n'''
+        r'''    \}\n'''
+    )
+    connector, replaced = gate_pattern.subn(new_gate, connector, count=1)
+    if replaced != 1:
+        raise SystemExit("Не найден loading gate WASM")
 connector_path.write_text(connector, encoding="utf-8")
 
-visual_path = frontend / "src/widgets/remnawave-settings/visual-settings-card/visual-settings-card.widget.tsx"
-visual = require(visual_path, "import { Group, SegmentedControl, Stack } from '@mantine/core'")
-visual = visual.replace(
-    "import { Group, SegmentedControl, Stack } from '@mantine/core'",
-    "import { Group, SegmentedControl, Stack, Switch } from '@mantine/core'",
-    1,
-)
-if "useExternalProfileEditorPreference" not in visual:
+experimental_path = frontend / "src/widgets/remnawave-settings/experimental-settings-card/experimental-settings-card.widget.tsx"
+if experimental_path.exists():
+    experimental = require(
+        experimental_path,
+        "import { useIsMobile } from '@shared/hooks'",
+    )
+    if "useExternalProfileEditorPreference" not in experimental:
+        experimental = experimental.replace(
+            "import { useIsMobile } from '@shared/hooks'",
+            "import { useExternalProfileEditorPreference } from "
+            "'@shared/external-profile-editor/preference'\n"
+            "import { useIsMobile } from '@shared/hooks'",
+            1,
+        )
+    if "externalEditorEnabled" not in experimental:
+        mobile_anchor = "    const isMobile = useIsMobile()\n"
+        if mobile_anchor not in experimental:
+            raise SystemExit("Не найден useIsMobile в Experimental settings")
+        experimental = experimental.replace(
+            mobile_anchor,
+            '''    const isMobile = useIsMobile()
+    const { enabled: externalEditorEnabled, setEnabled: setExternalEditorEnabled } =
+        useExternalProfileEditorPreference()
+''',
+            1,
+        )
+
+    editor_card = '''                    {!isMobile && (
+                        <Checkbox.Card
+                            checked={externalEditorEnabled}
+                            className={classes.feature}
+                            onClick={() => setExternalEditorEnabled(!externalEditorEnabled)}
+                            radius="md"
+                        >
+                            <Group align="center" gap="sm" wrap="nowrap">
+                                <ThemeIcon color="violet" radius="md" size="lg" variant="soft">
+                                    <TbLayoutSidebar size={20} />
+                                </ThemeIcon>
+
+                                <Text className={classes.label} flex={1} size="sm" truncate>
+                                    Xray UI Editor вместо WASM
+                                </Text>
+
+                                <Checkbox.Indicator size="sm" />
+                            </Group>
+                        </Checkbox.Card>
+                    )}'''
+    if editor_card not in experimental:
+        card_anchor = "                        ))}\n                </Stack>"
+        if card_anchor not in experimental:
+            raise SystemExit("Не найден конец списка Experimental settings")
+        experimental = experimental.replace(
+            card_anchor,
+            "                        ))}\n" + editor_card + "\n                </Stack>",
+            1,
+        )
+    experimental_path.write_text(experimental, encoding="utf-8")
+else:
+    visual_path = frontend / "src/widgets/remnawave-settings/visual-settings-card/visual-settings-card.widget.tsx"
+    visual = require(visual_path, "import { Group, SegmentedControl, Stack } from '@mantine/core'")
     visual = visual.replace(
-        "import { useIsMobile } from '@shared/hooks'",
-        "import { useExternalProfileEditorPreference } from "
-        "'@shared/external-profile-editor/preference'\n"
-        "import { useIsMobile } from '@shared/hooks'",
+        "import { Group, SegmentedControl, Stack } from '@mantine/core'",
+        "import { Group, SegmentedControl, Stack, Switch } from '@mantine/core'",
         1,
     )
-if "externalEditorEnabled" not in visual:
-    visual = visual.replace(
-        "    const toggleLayoutStyle = useToggleLayoutStyleAction()",
-        '''    const toggleLayoutStyle = useToggleLayoutStyleAction()
+    if "useExternalProfileEditorPreference" not in visual:
+        visual = visual.replace(
+            "import { useIsMobile } from '@shared/hooks'",
+            "import { useExternalProfileEditorPreference } from "
+            "'@shared/external-profile-editor/preference'\n"
+            "import { useIsMobile } from '@shared/hooks'",
+            1,
+        )
+    if "externalEditorEnabled" not in visual:
+        visual = visual.replace(
+            "    const toggleLayoutStyle = useToggleLayoutStyleAction()",
+            '''    const toggleLayoutStyle = useToggleLayoutStyleAction()
     const { enabled: externalEditorEnabled, setEnabled: setExternalEditorEnabled } =
         useExternalProfileEditorPreference()''',
-        1,
-    )
+            1,
+        )
 
-switch = '''                    <Switch
+    switch = '''                    <Switch
                         checked={externalEditorEnabled}
                         description="Встраивает Xray UI Editor вместо WASM только на компьютере. Настройка хранится в этом браузере."
                         label="Внешний редактор конфигурационных профилей"
@@ -1284,11 +1358,13 @@ switch = '''                    <Switch
                             setExternalEditorEnabled(event.currentTarget.checked)
                         }
                     />'''
-if switch not in visual:
-    anchor = '''                        value={layoutStyle}
+    if switch not in visual:
+        anchor = '''                        value={layoutStyle}
                     />'''
-    visual = visual.replace(anchor, anchor + "\n" + switch, 1)
-visual_path.write_text(visual, encoding="utf-8")
+        if anchor not in visual:
+            raise SystemExit("Не найден SegmentedControl в Visual settings")
+        visual = visual.replace(anchor, anchor + "\n" + switch, 1)
+    visual_path.write_text(visual, encoding="utf-8")
 
 
 frame_path = frontend / "src/shared/external-profile-editor/external-profile-editor-frame.tsx"
@@ -1400,7 +1476,6 @@ if "XRAY_EDITOR_URL" not in csp or "'frame-src'" not in csp:
 
 
 dockerfile = (backend / "Dockerfile").read_text(encoding="utf-8")
-import re
 match = re.search(r"^FROM node:[^\n]+ AS backend-build$", dockerfile, re.MULTILINE)
 if not match:
     raise SystemExit("Не найден backend-build stage в Dockerfile")
@@ -1536,7 +1611,8 @@ PANEL_RELEASE_FILE="$CACHE_ROOT/panel-release.json"
 EDITOR_LATEST_VERSION=""
 
 check_patch_compatibility_panel() {
-    local version="$1" root="$CACHE_ROOT/compat-panel-$version"
+    local version="$1"
+    local root="$CACHE_ROOT/compat-panel-$version"
     rm -rf "$root"
     mkdir -p "$root"
 
@@ -1559,7 +1635,8 @@ check_patch_compatibility_panel() {
 }
 
 check_patch_compatibility_editor() {
-    local version="$1" root="$CACHE_ROOT/compat-editor-$version"
+    local version="$1"
+    local root="$CACHE_ROOT/compat-editor-$version"
     rm -rf "$root"
     mkdir -p "$root"
 
